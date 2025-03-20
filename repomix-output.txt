@@ -1,0 +1,3813 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+================================================================
+File Summary
+================================================================
+
+Purpose:
+--------
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+
+File Format:
+------------
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Multiple file entries, each consisting of:
+  a. A separator line (================)
+  b. The file path (File: path/to/file)
+  c. Another separator line
+  d. The full contents of the file
+  e. A blank line
+
+Usage Guidelines:
+-----------------
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+
+Notes:
+------
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+
+Additional Info:
+----------------
+
+================================================================
+Directory Structure
+================================================================
+ai-model/
+  Dockerfile
+  main.py
+  requirements.txt
+backend/
+  models/
+    Incident.js
+    Recommendation.js
+    Unit.js
+  routes/
+    incidents.js
+    recommendations.js
+    units.js
+  scripts/
+    seed.js
+  Dockerfile
+  package.json
+  server.js
+frontend/
+  .git/
+    hooks/
+      applypatch-msg.sample
+      commit-msg.sample
+      fsmonitor-watchman.sample
+      post-update.sample
+      pre-applypatch.sample
+      pre-commit.sample
+      pre-merge-commit.sample
+      pre-push.sample
+      pre-rebase.sample
+      pre-receive.sample
+      prepare-commit-msg.sample
+      push-to-checkout.sample
+      update.sample
+    info/
+      exclude
+    refs/
+      heads/
+        main
+    COMMIT_EDITMSG
+    config
+    description
+    HEAD
+  public/
+    index.html
+    manifest.json
+    robots.txt
+  src/
+    components/
+      Dashboard.tsx
+      Header.tsx
+    services/
+      api.ts
+      socket.ts
+    types/
+      index.ts
+    App.css
+    App.test.tsx
+    App.tsx
+    index.css
+    index.tsx
+    logo.svg
+    react-app-env.d.ts
+    reportWebVitals.ts
+    setupTests.ts
+  .gitignore
+  Dockerfile
+  nginx.conf
+  package.json
+  README.md
+  tsconfig.json
+.gitignore
+docker-compose.yml
+install-all.sh
+README.md
+
+================================================================
+Files
+================================================================
+
+================
+File: ai-model/Dockerfile
+================
+FROM python:3.9-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+================
+File: ai-model/main.py
+================
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+from typing import List, Optional
+import numpy as np
+import uvicorn
+import requests
+import math
+import os
+from datetime import datetime
+import json
+from pymongo import MongoClient
+from bson import ObjectId
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Set up MongoDB connection
+MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/rapidresponse")
+client = MongoClient(MONGODB_URI)
+db = client.get_database()
+
+app = FastAPI(title="RapidResponse AI Dispatch Service")
+
+# Custom JSONEncoder to handle ObjectId for storing recommendations
+class MongoJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, ObjectId):
+            return str(obj)
+        return super().default(obj)
+
+# Dispatch model for resource allocation
+class DispatchModel:
+    def __init__(self):
+        # These would be parameters from a trained model
+        self.priority_weights = {
+            1: 0.25,  # Low priority
+            2: 0.5,
+            3: 0.75,
+            4: 0.9,
+            5: 1.0    # Highest priority
+        }
+        
+        # Type compatibility matrix - which unit types can handle which incident types
+        self.type_compatibility = {
+            "MEDICAL": ["AMBULANCE"],
+            "FIRE": ["FIRE_ENGINE"],
+            "POLICE": ["POLICE_CAR"],
+            "OTHER": ["AMBULANCE", "FIRE_ENGINE", "POLICE_CAR", "OTHER"]
+        }
+    
+    def score_unit(self, unit, incident_location, incident_type, priority):
+        """Score a unit's suitability for an incident."""
+        # Calculate distance (simplified - using Euclidean distance)
+        unit_loc = unit["location"]["coordinates"]
+        incident_loc = incident_location
+        
+        # Calculate distance in km (approximate)
+        dx = 111.32 * (unit_loc[1] - incident_loc[1]) # latitude difference in km
+        dy = 111.32 * math.cos(incident_loc[0] * math.pi / 180) * (unit_loc[0] - incident_loc[0]) # longitude difference in km
+        distance = math.sqrt(dx**2 + dy**2)
+        
+        # Distance score (inverse - closer is better)
+        distance_score = 1 / (1 + distance)
+        
+        # Type compatibility score
+        type_score = 1.0 if unit["type"] in self.type_compatibility.get(incident_type, []) else 0.0
+        
+        # Priority weight
+        priority_weight = self.priority_weights.get(priority, 0.5)
+        
+        # Final score combines distance, type compatibility, and priority
+        final_score = distance_score * type_score * priority_weight
+        
+        return {
+            "unit_id": str(unit["_id"]),
+            "call_sign": unit["callSign"],
+            "type": unit["type"],
+            "distance": distance,
+            "score": final_score
+        }
+
+# Request model
+class DispatchRequest(BaseModel):
+    incidentType: str
+    priority: int
+    location: List[float]  # [longitude, latitude]
+    currentlyAssignedUnits: Optional[List[str]] = []
+    incidentId: Optional[str] = None
+
+# Response model for unit recommendations
+class UnitRecommendation(BaseModel):
+    unit_id: str
+    call_sign: str
+    type: str
+    distance: float
+    score: float
+
+# Create model instance
+dispatch_model = DispatchModel()
+
+# Get available units from MongoDB
+def get_available_units():
+    try:
+        # Query MongoDB for all available units
+        units = list(db.units.find({"status": "AVAILABLE"}))
+        
+        # Convert ObjectId to string for serialization
+        for unit in units:
+            unit["_id"] = str(unit["_id"])
+            
+        return units
+    except Exception as e:
+        print(f"Error getting units from database: {e}")
+        return []
+
+# Store recommendations in the database
+def store_recommendations(incident_id, recommendations):
+    try:
+        # Create a recommendation document
+        recommendation_doc = {
+            "incidentId": ObjectId(incident_id),
+            "recommendations": recommendations,
+            "timestamp": datetime.now(),
+            "status": "PENDING"  # PENDING, ACCEPTED, REJECTED
+        }
+        
+        # Insert into MongoDB
+        result = db.recommendations.insert_one(recommendation_doc)
+        return str(result.inserted_id)
+    except Exception as e:
+        print(f"Error storing recommendations: {e}")
+        return None
+
+@app.get("/")
+def read_root():
+    return {"message": "RapidResponse AI Dispatch Service"}
+
+@app.post("/predict", response_model=List[UnitRecommendation])
+def predict_dispatch(request: DispatchRequest, background_tasks: BackgroundTasks):
+    """Recommend units for dispatch based on incident details."""
+    try:
+        # Query the database for available units
+        units = get_available_units()
+        
+        # Filter out units that are already assigned to this incident
+        available_units = [u for u in units if u["_id"] not in request.currentlyAssignedUnits]
+        
+        # Score each unit for this incident
+        scored_units = []
+        for unit in available_units:
+            score = dispatch_model.score_unit(
+                unit, 
+                request.location, 
+                request.incidentType, 
+                request.priority
+            )
+            scored_units.append(score)
+        
+        # Sort by score (descending)
+        scored_units.sort(key=lambda x: x["score"], reverse=True)
+        
+        # Get top 3 recommendations (or fewer if not enough available)
+        top_recommendations = scored_units[:3]
+        
+        # Store recommendations in database if incident ID provided
+        if request.incidentId:
+            background_tasks.add_task(store_recommendations, request.incidentId, top_recommendations)
+        
+        return top_recommendations
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+
+================
+File: ai-model/requirements.txt
+================
+fastapi==0.104.1
+uvicorn==0.23.2
+numpy==1.24.3
+scikit-learn==1.3.0
+pandas==2.0.3
+pydantic==2.4.2
+tensorflow-macos>=2.11.0; sys_platform == 'darwin' and platform_machine == 'arm64'
+tensorflow>=2.11.0; (sys_platform != 'darwin' or platform_machine != 'arm64')
+requests==2.31.0
+pymongo==4.5.0
+python-dotenv==1.0.0
+
+================
+File: backend/models/Incident.js
+================
+const mongoose = require('mongoose');
+
+const incidentSchema = new mongoose.Schema({
+  type: {
+    type: String,
+    required: true,
+    enum: ['MEDICAL', 'FIRE', 'POLICE', 'OTHER']
+  },
+  priority: {
+    type: Number,
+    required: true,
+    min: 1,
+    max: 5
+  },
+  location: {
+    type: {
+      type: String,
+      default: 'Point',
+      enum: ['Point']
+    },
+    coordinates: {
+      type: [Number], // [longitude, latitude]
+      required: true
+    },
+    address: {
+      type: String,
+      required: true
+    }
+  },
+  description: {
+    type: String,
+    required: true
+  },
+  status: {
+    type: String,
+    enum: ['PENDING', 'DISPATCHED', 'EN_ROUTE', 'ON_SCENE', 'RESOLVED'],
+    default: 'PENDING'
+  },
+  dispatchedUnits: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Unit'
+  }],
+  createdAt: {
+    type: Date,
+    default: Date.now
+  },
+  updatedAt: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+// Create a 2dsphere index for location-based queries
+incidentSchema.index({ 'location.coordinates': '2dsphere' });
+
+const Incident = mongoose.model('Incident', incidentSchema);
+
+module.exports = Incident;
+
+================
+File: backend/models/Recommendation.js
+================
+const mongoose = require('mongoose');
+
+const recommendationSchema = new mongoose.Schema({
+  incident: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Incident',
+    required: true
+  },
+  recommendations: [{
+    unit_id: String,
+    call_sign: String,
+    type: String,
+    distance: Number,
+    score: Number
+  }],
+  status: {
+    type: String,
+    enum: ['PENDING', 'ACCEPTED', 'REJECTED'],
+    default: 'PENDING'
+  },
+  acceptedUnitId: {
+    type: String,
+    default: null
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+const Recommendation = mongoose.model('Recommendation', recommendationSchema);
+
+module.exports = Recommendation;
+
+================
+File: backend/models/Unit.js
+================
+const mongoose = require('mongoose');
+
+const unitSchema = new mongoose.Schema({
+  callSign: {
+    type: String,
+    required: true,
+    unique: true
+  },
+  type: {
+    type: String,
+    required: true,
+    enum: ['AMBULANCE', 'FIRE_ENGINE', 'POLICE_CAR', 'OTHER']
+  },
+  capabilities: [{
+    type: String,
+    enum: ['ALS', 'BLS', 'HAZMAT', 'RESCUE', 'K9', 'TACTICAL']
+  }],
+  status: {
+    type: String,
+    enum: ['AVAILABLE', 'DISPATCHED', 'EN_ROUTE', 'ON_SCENE', 'RETURNING', 'OUT_OF_SERVICE'],
+    default: 'AVAILABLE'
+  },
+  location: {
+    type: {
+      type: String,
+      default: 'Point',
+      enum: ['Point']
+    },
+    coordinates: {
+      type: [Number], // [longitude, latitude]
+      required: true
+    }
+  },
+  currentIncident: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Incident',
+    default: null
+  },
+  lastUpdated: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+// Create a 2dsphere index for location-based queries
+unitSchema.index({ 'location.coordinates': '2dsphere' });
+
+const Unit = mongoose.model('Unit', unitSchema);
+
+module.exports = Unit;
+
+================
+File: backend/routes/incidents.js
+================
+const express = require('express');
+const router = express.Router();
+const Incident = require('../models/Incident');
+const Unit = require('../models/Unit');
+const Recommendation = require('../models/Recommendation');
+const axios = require('axios');
+const mongoose = require('mongoose');
+
+// Reference to io needs to be set from server.js
+let io;
+router.setIo = function(socketIo) {
+  io = socketIo;
+};
+
+// Get all incidents
+router.get('/', async (req, res) => {
+  try {
+    const incidents = await Incident.find().populate('dispatchedUnits');
+    res.json(incidents);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Get incident by ID
+router.get('/:id', async (req, res) => {
+  try {
+    const incident = await Incident.findById(req.params.id).populate('dispatchedUnits');
+    if (!incident) return res.status(404).json({ message: 'Incident not found' });
+    res.json(incident);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Create a new incident
+router.post('/', async (req, res) => {
+  const incident = new Incident({
+    type: req.body.type,
+    priority: req.body.priority,
+    location: req.body.location,
+    description: req.body.description
+  });
+
+  try {
+    const newIncident = await incident.save();
+    
+    // Emit WebSocket event for new incident
+    if (io) {
+      io.emit('incident_created', newIncident);
+    }
+    
+    res.status(201).json(newIncident);
+  } catch (err) {
+    res.status(400).json({ message: err.message });
+  }
+});
+
+// Update incident status
+router.patch('/:id/status', async (req, res) => {
+  try {
+    const incident = await Incident.findById(req.params.id);
+    if (!incident) return res.status(404).json({ message: 'Incident not found' });
+    
+    const oldStatus = incident.status;
+    incident.status = req.body.status;
+    incident.updatedAt = Date.now();
+    
+    const updatedIncident = await incident.save();
+    
+    // Emit WebSocket event for status change
+    if (io && oldStatus !== updatedIncident.status) {
+      io.emit('incident_status_changed', {
+        incidentId: updatedIncident._id,
+        oldStatus,
+        newStatus: updatedIncident.status
+      });
+    }
+    
+    res.json(updatedIncident);
+  } catch (err) {
+    res.status(400).json({ message: err.message });
+  }
+});
+
+// Request AI-based unit dispatch recommendation
+router.post('/:id/recommend-units', async (req, res) => {
+  try {
+    const incident = await Incident.findById(req.params.id);
+    if (!incident) return res.status(404).json({ message: 'Incident not found' });
+    
+    // Call the AI service to get recommended units
+    const response = await axios.post(process.env.AI_SERVICE_URL, {
+      incidentType: incident.type,
+      priority: incident.priority,
+      location: incident.location.coordinates,
+      currentlyAssignedUnits: incident.dispatchedUnits.map(u => u.toString()),
+      incidentId: incident._id.toString()
+    });
+    
+    // Store the recommendations in our database
+    const recommendation = new Recommendation({
+      incident: incident._id,
+      recommendations: response.data,
+      status: 'PENDING'
+    });
+    
+    await recommendation.save();
+    
+    // Emit WebSocket event for new recommendations
+    if (io) {
+      io.emit('new_recommendations', {
+        incidentId: incident._id,
+        recommendations: response.data
+      });
+    }
+    
+    res.json(response.data);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Get all recommendations for an incident
+router.get('/:id/recommendations', async (req, res) => {
+  try {
+    const recommendations = await Recommendation.find({ 
+      incident: req.params.id 
+    }).sort({ createdAt: -1 });
+    
+    res.json(recommendations);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Dispatch a unit to an incident
+router.post('/:id/dispatch', async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
+  try {
+    const incident = await Incident.findById(req.params.id).session(session);
+    if (!incident) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({ message: 'Incident not found' });
+    }
+    
+    const unitId = req.body.unitId;
+    const unit = await Unit.findById(unitId).session(session);
+    if (!unit) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({ message: 'Unit not found' });
+    }
+    
+    // Check if the unit is already assigned to this incident
+    if (incident.dispatchedUnits.includes(unitId)) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(400).json({ message: 'Unit already assigned to this incident' });
+    }
+    
+    // Add the unit to the incident
+    incident.dispatchedUnits.push(unitId);
+    if (incident.status === 'PENDING') {
+      incident.status = 'DISPATCHED';
+    }
+    incident.updatedAt = Date.now();
+    await incident.save({ session });
+    
+    // Update the unit's status and current incident
+    unit.status = 'DISPATCHED';
+    unit.currentIncident = incident._id;
+    await unit.save({ session });
+    
+    // Update recommendation status if exists
+    if (req.body.recommendationId) {
+      await Recommendation.findByIdAndUpdate(
+        req.body.recommendationId,
+        { 
+          status: 'ACCEPTED',
+          acceptedUnitId: unitId
+        },
+        { session }
+      );
+    }
+    
+    await session.commitTransaction();
+    session.endSession();
+    
+    // Emit WebSocket event for dispatch
+    if (io) {
+      io.emit('unit_dispatched', {
+        unitId,
+        incidentId: incident._id,
+        unitCallSign: unit.callSign,
+        incidentType: incident.type,
+        incidentLocation: incident.location
+      });
+    }
+    
+    res.json({
+      incident: await Incident.findById(incident._id).populate('dispatchedUnits'),
+      unit: await Unit.findById(unit._id)
+    });
+  } catch (err) {
+    await session.abortTransaction();
+    session.endSession();
+    res.status(400).json({ message: err.message });
+  }
+});
+
+module.exports = router;
+
+================
+File: backend/routes/recommendations.js
+================
+const express = require('express');
+const router = express.Router();
+const Recommendation = require('../models/Recommendation');
+const Incident = require('../models/Incident');
+const Unit = require('../models/Unit');
+const mongoose = require('mongoose');
+
+// Reference to io needs to be set from server.js
+let io;
+router.setIo = function(socketIo) {
+  io = socketIo;
+};
+
+// Get all recommendations
+router.get('/', async (req, res) => {
+  try {
+    const recommendations = await Recommendation.find().sort({ createdAt: -1 });
+    res.json(recommendations);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Get a specific recommendation
+router.get('/:id', async (req, res) => {
+  try {
+    const recommendation = await Recommendation.findById(req.params.id);
+    if (!recommendation) return res.status(404).json({ message: 'Recommendation not found' });
+    res.json(recommendation);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Accept a recommendation
+router.post('/:id/accept', async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
+  try {
+    const recommendation = await Recommendation.findById(req.params.id).session(session);
+    if (!recommendation) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({ message: 'Recommendation not found' });
+    }
+    
+    const unitId = req.body.unitId;
+    const unit = await Unit.findById(unitId).session(session);
+    if (!unit) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({ message: 'Unit not found' });
+    }
+    
+    // Check if unit is available
+    if (unit.status !== 'AVAILABLE') {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(400).json({ message: 'Unit is not available for dispatch' });
+    }
+    
+    const incidentId = recommendation.incident;
+    const incident = await Incident.findById(incidentId).session(session);
+    if (!incident) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({ message: 'Incident not found' });
+    }
+    
+    // Update recommendation status
+    recommendation.status = 'ACCEPTED';
+    recommendation.acceptedUnitId = unitId;
+    await recommendation.save({ session });
+    
+    // Add the unit to the incident
+    incident.dispatchedUnits.push(unitId);
+    if (incident.status === 'PENDING') {
+      incident.status = 'DISPATCHED';
+    }
+    incident.updatedAt = Date.now();
+    await incident.save({ session });
+    
+    // Update the unit's status and current incident
+    unit.status = 'DISPATCHED';
+    unit.currentIncident = incident._id;
+    await unit.save({ session });
+    
+    await session.commitTransaction();
+    session.endSession();
+    
+    // Emit WebSocket event for dispatch
+    if (io) {
+      io.emit('unit_dispatched', {
+        unitId,
+        incidentId: incident._id,
+        unitCallSign: unit.callSign,
+        incidentType: incident.type,
+        incidentLocation: incident.location,
+        recommendationId: recommendation._id
+      });
+    }
+    
+    res.json(incident);
+  } catch (err) {
+    await session.abortTransaction();
+    session.endSession();
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Reject a recommendation
+router.post('/:id/reject', async (req, res) => {
+  try {
+    const recommendation = await Recommendation.findById(req.params.id);
+    if (!recommendation) return res.status(404).json({ message: 'Recommendation not found' });
+    
+    recommendation.status = 'REJECTED';
+    await recommendation.save();
+    
+    res.json(recommendation);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+module.exports = router;
+
+================
+File: backend/routes/units.js
+================
+const express = require('express');
+const router = express.Router();
+const Unit = require('../models/Unit');
+const Incident = require('../models/Incident');
+const mongoose = require('mongoose');
+
+// Reference to io needs to be set from server.js
+let io;
+router.setIo = function(socketIo) {
+  io = socketIo;
+};
+
+// Get all units
+router.get('/', async (req, res) => {
+  try {
+    const units = await Unit.find().populate('currentIncident');
+    res.json(units);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Get unit by ID
+router.get('/:id', async (req, res) => {
+  try {
+    const unit = await Unit.findById(req.params.id).populate('currentIncident');
+    if (!unit) return res.status(404).json({ message: 'Unit not found' });
+    res.json(unit);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Create a new unit
+router.post('/', async (req, res) => {
+  const unit = new Unit({
+    callSign: req.body.callSign,
+    type: req.body.type,
+    capabilities: req.body.capabilities,
+    location: req.body.location
+  });
+
+  try {
+    const newUnit = await unit.save();
+    
+    // Emit WebSocket event for new unit
+    if (io) {
+      io.emit('unit_created', newUnit);
+    }
+    
+    res.status(201).json(newUnit);
+  } catch (err) {
+    res.status(400).json({ message: err.message });
+  }
+});
+
+// Update unit status
+router.patch('/:id/status', async (req, res) => {
+  try {
+    const unit = await Unit.findById(req.params.id);
+    if (!unit) return res.status(404).json({ message: 'Unit not found' });
+    
+    const oldStatus = unit.status;
+    unit.status = req.body.status;
+    unit.lastUpdated = Date.now();
+    
+    const updatedUnit = await unit.save();
+    
+    // Emit WebSocket event for status change
+    if (io && oldStatus !== updatedUnit.status) {
+      io.emit('unit_status_changed', {
+        unitId: updatedUnit._id,
+        callSign: updatedUnit.callSign,
+        oldStatus,
+        newStatus: updatedUnit.status
+      });
+    }
+    
+    res.json(updatedUnit);
+  } catch (err) {
+    res.status(400).json({ message: err.message });
+  }
+});
+
+// Update unit location
+router.patch('/:id/location', async (req, res) => {
+  try {
+    const unit = await Unit.findById(req.params.id);
+    if (!unit) return res.status(404).json({ message: 'Unit not found' });
+    
+    const oldCoordinates = [...unit.location.coordinates];
+    unit.location.coordinates = req.body.coordinates;
+    unit.lastUpdated = Date.now();
+    
+    const updatedUnit = await unit.save();
+    
+    // Emit WebSocket event for location change
+    if (io) {
+      io.emit('unit_location_changed', {
+        unitId: updatedUnit._id.toString(),
+        callSign: updatedUnit.callSign,
+        coordinates: updatedUnit.location.coordinates,
+        oldCoordinates,
+        timestamp: updatedUnit.lastUpdated
+      });
+    }
+    
+    res.json(updatedUnit);
+  } catch (err) {
+    res.status(400).json({ message: err.message });
+  }
+});
+
+// Find nearest available units
+router.get('/available/nearest', async (req, res) => {
+  const { longitude, latitude, maxDistance = 20000, limit = 5 } = req.query;
+  
+  try {
+    const units = await Unit.find({
+      status: 'AVAILABLE',
+      'location.coordinates': {
+        $near: {
+          $geometry: {
+            type: 'Point',
+            coordinates: [parseFloat(longitude), parseFloat(latitude)]
+          },
+          $maxDistance: parseInt(maxDistance) // in meters
+        }
+      }
+    }).limit(parseInt(limit));
+    
+    res.json(units);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Assign a unit to an incident
+router.post('/:id/assign', async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
+  try {
+    const unit = await Unit.findById(req.params.id).session(session);
+    if (!unit) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({ message: 'Unit not found' });
+    }
+    
+    const incident = await Incident.findById(req.body.incidentId).session(session);
+    if (!incident) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({ message: 'Incident not found' });
+    }
+    
+    // Check if unit is available
+    if (unit.status !== 'AVAILABLE') {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(400).json({ message: `Unit is not available, current status: ${unit.status}` });
+    }
+    
+    // Update unit status and assign incident
+    const oldStatus = unit.status;
+    unit.status = 'DISPATCHED';
+    unit.currentIncident = incident._id;
+    unit.lastUpdated = Date.now();
+    await unit.save({ session });
+    
+    // Add unit to incident if not already there
+    if (!incident.dispatchedUnits.includes(unit._id)) {
+      const oldIncidentStatus = incident.status;
+      incident.dispatchedUnits.push(unit._id);
+      
+      if (incident.status === 'PENDING') {
+        incident.status = 'DISPATCHED';
+      }
+      
+      incident.updatedAt = Date.now();
+      await incident.save({ session });
+      
+      // Emit incident status change if changed
+      if (io && oldIncidentStatus !== incident.status) {
+        io.emit('incident_status_changed', {
+          incidentId: incident._id,
+          oldStatus: oldIncidentStatus,
+          newStatus: incident.status
+        });
+      }
+    }
+    
+    await session.commitTransaction();
+    session.endSession();
+    
+    // Emit unit dispatched event
+    if (io) {
+      io.emit('unit_dispatched', {
+        unitId: unit._id.toString(),
+        incidentId: incident._id.toString(),
+        unitCallSign: unit.callSign,
+        oldStatus,
+        newStatus: 'DISPATCHED'
+      });
+    }
+    
+    // Populate and return the full updated objects
+    const updatedUnit = await Unit.findById(unit._id).populate('currentIncident');
+    const updatedIncident = await Incident.findById(incident._id).populate('dispatchedUnits');
+    
+    res.json({
+      unit: updatedUnit,
+      incident: updatedIncident
+    });
+  } catch (err) {
+    await session.abortTransaction();
+    session.endSession();
+    res.status(400).json({ message: err.message });
+  }
+});
+
+module.exports = router;
+
+================
+File: backend/scripts/seed.js
+================
+const mongoose = require('mongoose');
+const Incident = require('../models/Incident');
+const Unit = require('../models/Unit');
+require('dotenv').config();
+
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log("Connected to MongoDB"))
+  .catch(err => console.error("MongoDB connection error:", err));
+
+const seedDatabase = async () => {
+  try {
+    // Clear existing data
+    await Incident.deleteMany({});
+    await Unit.deleteMany({});
+    
+    console.log("Existing data cleared");
+    
+    // Create sample units
+    const units = await Unit.insertMany([
+      { 
+        callSign: "A101", 
+        type: "AMBULANCE", 
+        status: "AVAILABLE", 
+        capabilities: ["ALS", "BLS"],
+        location: { 
+          type: "Point", 
+          coordinates: [-122.4194, 37.7749] 
+        } 
+      },
+      { 
+        callSign: "F202", 
+        type: "FIRE_ENGINE", 
+        status: "AVAILABLE", 
+        capabilities: ["HAZMAT", "RESCUE"],
+        location: { 
+          type: "Point", 
+          coordinates: [-122.431297, 37.773972] 
+        } 
+      },
+      { 
+        callSign: "P303", 
+        type: "POLICE_CAR", 
+        status: "AVAILABLE", 
+        capabilities: ["K9"],
+        location: { 
+          type: "Point", 
+          coordinates: [-122.446747, 37.765136] 
+        } 
+      },
+      { 
+        callSign: "A102", 
+        type: "AMBULANCE", 
+        status: "AVAILABLE", 
+        capabilities: ["ALS"],
+        location: { 
+          type: "Point", 
+          coordinates: [-122.410679, 37.782537] 
+        } 
+      },
+      { 
+        callSign: "F203", 
+        type: "FIRE_ENGINE", 
+        status: "AVAILABLE", 
+        capabilities: ["RESCUE"],
+        location: { 
+          type: "Point", 
+          coordinates: [-122.425097, 37.774853] 
+        } 
+      },
+    ]);
+
+    console.log(`Created ${units.length} units`);
+
+    // Create sample incidents
+    const incidents = await Incident.insertMany([
+      { 
+        type: "MEDICAL", 
+        priority: 5, 
+        location: { 
+          type: "Point", 
+          coordinates: [-122.420679, 37.772537], 
+          address: "500 Market St, San Francisco, CA" 
+        }, 
+        description: "Heart attack emergency", 
+        status: "PENDING", 
+        dispatchedUnits: [] 
+      },
+      { 
+        type: "FIRE", 
+        priority: 4, 
+        location: { 
+          type: "Point", 
+          coordinates: [-122.435097, 37.764853], 
+          address: "123 Main St, San Francisco, CA" 
+        }, 
+        description: "Building fire reported", 
+        status: "PENDING", 
+        dispatchedUnits: [] 
+      },
+      { 
+        type: "POLICE", 
+        priority: 3, 
+        location: { 
+          type: "Point", 
+          coordinates: [-122.447478, 37.758788], 
+          address: "456 Elm St, San Francisco, CA" 
+        }, 
+        description: "Armed robbery in progress", 
+        status: "PENDING", 
+        dispatchedUnits: [] 
+      },
+      { 
+        type: "MEDICAL", 
+        priority: 2, 
+        location: { 
+          type: "Point", 
+          coordinates: [-122.405097, 37.784853], 
+          address: "789 Oak St, San Francisco, CA" 
+        }, 
+        description: "Fall victim with possible fracture", 
+        status: "PENDING", 
+        dispatchedUnits: [] 
+      },
+      { 
+        type: "FIRE", 
+        priority: 4, 
+        location: { 
+          type: "Point", 
+          coordinates: [-122.415097, 37.774853], 
+          address: "321 Pine St, San Francisco, CA" 
+        }, 
+        description: "Gas leak reported", 
+        status: "PENDING", 
+        dispatchedUnits: [] 
+      },
+    ]);
+
+    console.log(`Created ${incidents.length} incidents`);
+    console.log("Database seeded successfully!");
+    mongoose.connection.close();
+  } catch (error) {
+    console.error("Seeding error:", error);
+    mongoose.connection.close();
+  }
+};
+
+seedDatabase();
+
+================
+File: backend/Dockerfile
+================
+FROM node:18-alpine
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+
+RUN npm ci --only=production
+
+COPY . .
+
+EXPOSE 5001
+
+CMD ["node", "server.js"]
+
+================
+File: backend/package.json
+================
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "axios": "^1.8.4",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "mongoose": "^8.12.1",
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  }
+}
+
+================
+File: backend/server.js
+================
+const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+const mongoose = require('mongoose');
+const cors = require('cors');
+require('dotenv').config();
+const axios = require('axios');
+
+// Routes
+const incidentRoutes = require('./routes/incidents');
+const unitRoutes = require('./routes/units');
+const recommendationRoutes = require('./routes/recommendations');
+
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST']
+  }
+});
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// Connect to MongoDB
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log('Connected to MongoDB'))
+  .catch(err => console.error('Could not connect to MongoDB', err));
+
+// Pass io reference to routes
+incidentRoutes.setIo(io);
+unitRoutes.setIo(io);
+recommendationRoutes.setIo(io);
+
+// API Routes
+app.use('/api/incidents', incidentRoutes);
+app.use('/api/units', unitRoutes);
+app.use('/api/recommendations', recommendationRoutes);
+
+// Socket.IO for real-time updates
+io.on('connection', (socket) => {
+  console.log('Client connected:', socket.id);
+  
+  socket.on('unit_location_update', (data) => {
+    // Forward this to the unit location update API
+    if (data && data.unitId && data.coordinates) {
+      try {
+        axios.patch(`${process.env.BASE_URL}/api/units/${data.unitId}/location`, {
+          coordinates: data.coordinates
+        });
+      } catch (err) {
+        console.error('Error updating unit location:', err);
+      }
+    }
+  });
+  
+  socket.on('new_incident', (data) => {
+    // Forward to the create incident API
+    if (data) {
+      try {
+        axios.post(`${process.env.BASE_URL}/api/incidents`, data);
+      } catch (err) {
+        console.error('Error creating incident:', err);
+      }
+    }
+  });
+  
+  socket.on('dispatch_unit', async (data) => {
+    // Forward to the unit assign API
+    if (data && data.unitId && data.incidentId) {
+      try {
+        axios.post(`${process.env.BASE_URL}/api/units/${data.unitId}/assign`, {
+          incidentId: data.incidentId
+        });
+      } catch (err) {
+        console.error('Error dispatching unit:', err);
+      }
+    }
+  });
+  
+  socket.on('disconnect', () => {
+    console.log('Client disconnected:', socket.id);
+  });
+});
+
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+================
+File: frontend/.git/hooks/applypatch-msg.sample
+================
+#!/bin/sh
+#
+# An example hook script to check the commit log message taken by
+# applypatch from an e-mail message.
+#
+# The hook should exit with non-zero status after issuing an
+# appropriate message if it wants to stop the commit.  The hook is
+# allowed to edit the commit message file.
+#
+# To enable this hook, rename this file to "applypatch-msg".
+
+. git-sh-setup
+commitmsg="$(git rev-parse --git-path hooks/commit-msg)"
+test -x "$commitmsg" && exec "$commitmsg" ${1+"$@"}
+:
+
+================
+File: frontend/.git/hooks/commit-msg.sample
+================
+#!/bin/sh
+#
+# An example hook script to check the commit log message.
+# Called by "git commit" with one argument, the name of the file
+# that has the commit message.  The hook should exit with non-zero
+# status after issuing an appropriate message if it wants to stop the
+# commit.  The hook is allowed to edit the commit message file.
+#
+# To enable this hook, rename this file to "commit-msg".
+
+# Uncomment the below to add a Signed-off-by line to the message.
+# Doing this in a hook is a bad idea in general, but the prepare-commit-msg
+# hook is more suited to it.
+#
+# SOB=$(git var GIT_AUTHOR_IDENT | sed -n 's/^\(.*>\).*$/Signed-off-by: \1/p')
+# grep -qs "^$SOB" "$1" || echo "$SOB" >> "$1"
+
+# This example catches duplicate Signed-off-by lines.
+
+test "" = "$(grep '^Signed-off-by: ' "$1" |
+	 sort | uniq -c | sed -e '/^[ 	]*1[ 	]/d')" || {
+	echo >&2 Duplicate Signed-off-by lines.
+	exit 1
+}
+
+================
+File: frontend/.git/hooks/fsmonitor-watchman.sample
+================
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use IPC::Open2;
+
+# An example hook script to integrate Watchman
+# (https://facebook.github.io/watchman/) with git to speed up detecting
+# new and modified files.
+#
+# The hook is passed a version (currently 2) and last update token
+# formatted as a string and outputs to stdout a new update token and
+# all files that have been modified since the update token. Paths must
+# be relative to the root of the working tree and separated by a single NUL.
+#
+# To enable this hook, rename this file to "query-watchman" and set
+# 'git config core.fsmonitor .git/hooks/query-watchman'
+#
+my ($version, $last_update_token) = @ARGV;
+
+# Uncomment for debugging
+# print STDERR "$0 $version $last_update_token\n";
+
+# Check the hook interface version
+if ($version ne 2) {
+	die "Unsupported query-fsmonitor hook version '$version'.\n" .
+	    "Falling back to scanning...\n";
+}
+
+my $git_work_tree = get_working_dir();
+
+my $retry = 1;
+
+my $json_pkg;
+eval {
+	require JSON::XS;
+	$json_pkg = "JSON::XS";
+	1;
+} or do {
+	require JSON::PP;
+	$json_pkg = "JSON::PP";
+};
+
+launch_watchman();
+
+sub launch_watchman {
+	my $o = watchman_query();
+	if (is_work_tree_watched($o)) {
+		output_result($o->{clock}, @{$o->{files}});
+	}
+}
+
+sub output_result {
+	my ($clockid, @files) = @_;
+
+	# Uncomment for debugging watchman output
+	# open (my $fh, ">", ".git/watchman-output.out");
+	# binmode $fh, ":utf8";
+	# print $fh "$clockid\n@files\n";
+	# close $fh;
+
+	binmode STDOUT, ":utf8";
+	print $clockid;
+	print "\0";
+	local $, = "\0";
+	print @files;
+}
+
+sub watchman_clock {
+	my $response = qx/watchman clock "$git_work_tree"/;
+	die "Failed to get clock id on '$git_work_tree'.\n" .
+		"Falling back to scanning...\n" if $? != 0;
+
+	return $json_pkg->new->utf8->decode($response);
+}
+
+sub watchman_query {
+	my $pid = open2(\*CHLD_OUT, \*CHLD_IN, 'watchman -j --no-pretty')
+	or die "open2() failed: $!\n" .
+	"Falling back to scanning...\n";
+
+	# In the query expression below we're asking for names of files that
+	# changed since $last_update_token but not from the .git folder.
+	#
+	# To accomplish this, we're using the "since" generator to use the
+	# recency index to select candidate nodes and "fields" to limit the
+	# output to file names only. Then we're using the "expression" term to
+	# further constrain the results.
+	my $last_update_line = "";
+	if (substr($last_update_token, 0, 1) eq "c") {
+		$last_update_token = "\"$last_update_token\"";
+		$last_update_line = qq[\n"since": $last_update_token,];
+	}
+	my $query = <<"	END";
+		["query", "$git_work_tree", {$last_update_line
+			"fields": ["name"],
+			"expression": ["not", ["dirname", ".git"]]
+		}]
+	END
+
+	# Uncomment for debugging the watchman query
+	# open (my $fh, ">", ".git/watchman-query.json");
+	# print $fh $query;
+	# close $fh;
+
+	print CHLD_IN $query;
+	close CHLD_IN;
+	my $response = do {local $/; <CHLD_OUT>};
+
+	# Uncomment for debugging the watch response
+	# open ($fh, ">", ".git/watchman-response.json");
+	# print $fh $response;
+	# close $fh;
+
+	die "Watchman: command returned no output.\n" .
+	"Falling back to scanning...\n" if $response eq "";
+	die "Watchman: command returned invalid output: $response\n" .
+	"Falling back to scanning...\n" unless $response =~ /^\{/;
+
+	return $json_pkg->new->utf8->decode($response);
+}
+
+sub is_work_tree_watched {
+	my ($output) = @_;
+	my $error = $output->{error};
+	if ($retry > 0 and $error and $error =~ m/unable to resolve root .* directory (.*) is not watched/) {
+		$retry--;
+		my $response = qx/watchman watch "$git_work_tree"/;
+		die "Failed to make watchman watch '$git_work_tree'.\n" .
+		    "Falling back to scanning...\n" if $? != 0;
+		$output = $json_pkg->new->utf8->decode($response);
+		$error = $output->{error};
+		die "Watchman: $error.\n" .
+		"Falling back to scanning...\n" if $error;
+
+		# Uncomment for debugging watchman output
+		# open (my $fh, ">", ".git/watchman-output.out");
+		# close $fh;
+
+		# Watchman will always return all files on the first query so
+		# return the fast "everything is dirty" flag to git and do the
+		# Watchman query just to get it over with now so we won't pay
+		# the cost in git to look up each individual file.
+		my $o = watchman_clock();
+		$error = $output->{error};
+
+		die "Watchman: $error.\n" .
+		"Falling back to scanning...\n" if $error;
+
+		output_result($o->{clock}, ("/"));
+		$last_update_token = $o->{clock};
+
+		eval { launch_watchman() };
+		return 0;
+	}
+
+	die "Watchman: $error.\n" .
+	"Falling back to scanning...\n" if $error;
+
+	return 1;
+}
+
+sub get_working_dir {
+	my $working_dir;
+	if ($^O =~ 'msys' || $^O =~ 'cygwin') {
+		$working_dir = Win32::GetCwd();
+		$working_dir =~ tr/\\/\//;
+	} else {
+		require Cwd;
+		$working_dir = Cwd::cwd();
+	}
+
+	return $working_dir;
+}
+
+================
+File: frontend/.git/hooks/post-update.sample
+================
+#!/bin/sh
+#
+# An example hook script to prepare a packed repository for use over
+# dumb transports.
+#
+# To enable this hook, rename this file to "post-update".
+
+exec git update-server-info
+
+================
+File: frontend/.git/hooks/pre-applypatch.sample
+================
+#!/bin/sh
+#
+# An example hook script to verify what is about to be committed
+# by applypatch from an e-mail message.
+#
+# The hook should exit with non-zero status after issuing an
+# appropriate message if it wants to stop the commit.
+#
+# To enable this hook, rename this file to "pre-applypatch".
+
+. git-sh-setup
+precommit="$(git rev-parse --git-path hooks/pre-commit)"
+test -x "$precommit" && exec "$precommit" ${1+"$@"}
+:
+
+================
+File: frontend/.git/hooks/pre-commit.sample
+================
+#!/bin/sh
+#
+# An example hook script to verify what is about to be committed.
+# Called by "git commit" with no arguments.  The hook should
+# exit with non-zero status after issuing an appropriate message if
+# it wants to stop the commit.
+#
+# To enable this hook, rename this file to "pre-commit".
+
+if git rev-parse --verify HEAD >/dev/null 2>&1
+then
+	against=HEAD
+else
+	# Initial commit: diff against an empty tree object
+	against=$(git hash-object -t tree /dev/null)
+fi
+
+# If you want to allow non-ASCII filenames set this variable to true.
+allownonascii=$(git config --type=bool hooks.allownonascii)
+
+# Redirect output to stderr.
+exec 1>&2
+
+# Cross platform projects tend to avoid non-ASCII filenames; prevent
+# them from being added to the repository. We exploit the fact that the
+# printable range starts at the space character and ends with tilde.
+if [ "$allownonascii" != "true" ] &&
+	# Note that the use of brackets around a tr range is ok here, (it's
+	# even required, for portability to Solaris 10's /usr/bin/tr), since
+	# the square bracket bytes happen to fall in the designated range.
+	test $(git diff --cached --name-only --diff-filter=A -z $against |
+	  LC_ALL=C tr -d '[ -~]\0' | wc -c) != 0
+then
+	cat <<\EOF
+Error: Attempt to add a non-ASCII file name.
+
+This can cause problems if you want to work with people on other platforms.
+
+To be portable it is advisable to rename the file.
+
+If you know what you are doing you can disable this check using:
+
+  git config hooks.allownonascii true
+EOF
+	exit 1
+fi
+
+# If there are whitespace errors, print the offending file names and fail.
+exec git diff-index --check --cached $against --
+
+================
+File: frontend/.git/hooks/pre-merge-commit.sample
+================
+#!/bin/sh
+#
+# An example hook script to verify what is about to be committed.
+# Called by "git merge" with no arguments.  The hook should
+# exit with non-zero status after issuing an appropriate message to
+# stderr if it wants to stop the merge commit.
+#
+# To enable this hook, rename this file to "pre-merge-commit".
+
+. git-sh-setup
+test -x "$GIT_DIR/hooks/pre-commit" &&
+        exec "$GIT_DIR/hooks/pre-commit"
+:
+
+================
+File: frontend/.git/hooks/pre-push.sample
+================
+#!/bin/sh
+
+# An example hook script to verify what is about to be pushed.  Called by "git
+# push" after it has checked the remote status, but before anything has been
+# pushed.  If this script exits with a non-zero status nothing will be pushed.
+#
+# This hook is called with the following parameters:
+#
+# $1 -- Name of the remote to which the push is being done
+# $2 -- URL to which the push is being done
+#
+# If pushing without using a named remote those arguments will be equal.
+#
+# Information about the commits which are being pushed is supplied as lines to
+# the standard input in the form:
+#
+#   <local ref> <local oid> <remote ref> <remote oid>
+#
+# This sample shows how to prevent push of commits where the log message starts
+# with "WIP" (work in progress).
+
+remote="$1"
+url="$2"
+
+zero=$(git hash-object --stdin </dev/null | tr '[0-9a-f]' '0')
+
+while read local_ref local_oid remote_ref remote_oid
+do
+	if test "$local_oid" = "$zero"
+	then
+		# Handle delete
+		:
+	else
+		if test "$remote_oid" = "$zero"
+		then
+			# New branch, examine all commits
+			range="$local_oid"
+		else
+			# Update to existing branch, examine new commits
+			range="$remote_oid..$local_oid"
+		fi
+
+		# Check for WIP commit
+		commit=$(git rev-list -n 1 --grep '^WIP' "$range")
+		if test -n "$commit"
+		then
+			echo >&2 "Found WIP commit in $local_ref, not pushing"
+			exit 1
+		fi
+	fi
+done
+
+exit 0
+
+================
+File: frontend/.git/hooks/pre-rebase.sample
+================
+#!/bin/sh
+#
+# Copyright (c) 2006, 2008 Junio C Hamano
+#
+# The "pre-rebase" hook is run just before "git rebase" starts doing
+# its job, and can prevent the command from running by exiting with
+# non-zero status.
+#
+# The hook is called with the following parameters:
+#
+# $1 -- the upstream the series was forked from.
+# $2 -- the branch being rebased (or empty when rebasing the current branch).
+#
+# This sample shows how to prevent topic branches that are already
+# merged to 'next' branch from getting rebased, because allowing it
+# would result in rebasing already published history.
+
+publish=next
+basebranch="$1"
+if test "$#" = 2
+then
+	topic="refs/heads/$2"
+else
+	topic=`git symbolic-ref HEAD` ||
+	exit 0 ;# we do not interrupt rebasing detached HEAD
+fi
+
+case "$topic" in
+refs/heads/??/*)
+	;;
+*)
+	exit 0 ;# we do not interrupt others.
+	;;
+esac
+
+# Now we are dealing with a topic branch being rebased
+# on top of master.  Is it OK to rebase it?
+
+# Does the topic really exist?
+git show-ref -q "$topic" || {
+	echo >&2 "No such branch $topic"
+	exit 1
+}
+
+# Is topic fully merged to master?
+not_in_master=`git rev-list --pretty=oneline ^master "$topic"`
+if test -z "$not_in_master"
+then
+	echo >&2 "$topic is fully merged to master; better remove it."
+	exit 1 ;# we could allow it, but there is no point.
+fi
+
+# Is topic ever merged to next?  If so you should not be rebasing it.
+only_next_1=`git rev-list ^master "^$topic" ${publish} | sort`
+only_next_2=`git rev-list ^master           ${publish} | sort`
+if test "$only_next_1" = "$only_next_2"
+then
+	not_in_topic=`git rev-list "^$topic" master`
+	if test -z "$not_in_topic"
+	then
+		echo >&2 "$topic is already up to date with master"
+		exit 1 ;# we could allow it, but there is no point.
+	else
+		exit 0
+	fi
+else
+	not_in_next=`git rev-list --pretty=oneline ^${publish} "$topic"`
+	/usr/bin/perl -e '
+		my $topic = $ARGV[0];
+		my $msg = "* $topic has commits already merged to public branch:\n";
+		my (%not_in_next) = map {
+			/^([0-9a-f]+) /;
+			($1 => 1);
+		} split(/\n/, $ARGV[1]);
+		for my $elem (map {
+				/^([0-9a-f]+) (.*)$/;
+				[$1 => $2];
+			} split(/\n/, $ARGV[2])) {
+			if (!exists $not_in_next{$elem->[0]}) {
+				if ($msg) {
+					print STDERR $msg;
+					undef $msg;
+				}
+				print STDERR " $elem->[1]\n";
+			}
+		}
+	' "$topic" "$not_in_next" "$not_in_master"
+	exit 1
+fi
+
+<<\DOC_END
+
+This sample hook safeguards topic branches that have been
+published from being rewound.
+
+The workflow assumed here is:
+
+ * Once a topic branch forks from "master", "master" is never
+   merged into it again (either directly or indirectly).
+
+ * Once a topic branch is fully cooked and merged into "master",
+   it is deleted.  If you need to build on top of it to correct
+   earlier mistakes, a new topic branch is created by forking at
+   the tip of the "master".  This is not strictly necessary, but
+   it makes it easier to keep your history simple.
+
+ * Whenever you need to test or publish your changes to topic
+   branches, merge them into "next" branch.
+
+The script, being an example, hardcodes the publish branch name
+to be "next", but it is trivial to make it configurable via
+$GIT_DIR/config mechanism.
+
+With this workflow, you would want to know:
+
+(1) ... if a topic branch has ever been merged to "next".  Young
+    topic branches can have stupid mistakes you would rather
+    clean up before publishing, and things that have not been
+    merged into other branches can be easily rebased without
+    affecting other people.  But once it is published, you would
+    not want to rewind it.
+
+(2) ... if a topic branch has been fully merged to "master".
+    Then you can delete it.  More importantly, you should not
+    build on top of it -- other people may already want to
+    change things related to the topic as patches against your
+    "master", so if you need further changes, it is better to
+    fork the topic (perhaps with the same name) afresh from the
+    tip of "master".
+
+Let's look at this example:
+
+		   o---o---o---o---o---o---o---o---o---o "next"
+		  /       /           /           /
+		 /   a---a---b A     /           /
+		/   /               /           /
+	       /   /   c---c---c---c B         /
+	      /   /   /             \         /
+	     /   /   /   b---b C     \       /
+	    /   /   /   /             \     /
+    ---o---o---o---o---o---o---o---o---o---o---o "master"
+
+
+A, B and C are topic branches.
+
+ * A has one fix since it was merged up to "next".
+
+ * B has finished.  It has been fully merged up to "master" and "next",
+   and is ready to be deleted.
+
+ * C has not merged to "next" at all.
+
+We would want to allow C to be rebased, refuse A, and encourage
+B to be deleted.
+
+To compute (1):
+
+	git rev-list ^master ^topic next
+	git rev-list ^master        next
+
+	if these match, topic has not merged in next at all.
+
+To compute (2):
+
+	git rev-list master..topic
+
+	if this is empty, it is fully merged to "master".
+
+DOC_END
+
+================
+File: frontend/.git/hooks/pre-receive.sample
+================
+#!/bin/sh
+#
+# An example hook script to make use of push options.
+# The example simply echoes all push options that start with 'echoback='
+# and rejects all pushes when the "reject" push option is used.
+#
+# To enable this hook, rename this file to "pre-receive".
+
+if test -n "$GIT_PUSH_OPTION_COUNT"
+then
+	i=0
+	while test "$i" -lt "$GIT_PUSH_OPTION_COUNT"
+	do
+		eval "value=\$GIT_PUSH_OPTION_$i"
+		case "$value" in
+		echoback=*)
+			echo "echo from the pre-receive-hook: ${value#*=}" >&2
+			;;
+		reject)
+			exit 1
+		esac
+		i=$((i + 1))
+	done
+fi
+
+================
+File: frontend/.git/hooks/prepare-commit-msg.sample
+================
+#!/bin/sh
+#
+# An example hook script to prepare the commit log message.
+# Called by "git commit" with the name of the file that has the
+# commit message, followed by the description of the commit
+# message's source.  The hook's purpose is to edit the commit
+# message file.  If the hook fails with a non-zero status,
+# the commit is aborted.
+#
+# To enable this hook, rename this file to "prepare-commit-msg".
+
+# This hook includes three examples. The first one removes the
+# "# Please enter the commit message..." help message.
+#
+# The second includes the output of "git diff --name-status -r"
+# into the message, just before the "git status" output.  It is
+# commented because it doesn't cope with --amend or with squashed
+# commits.
+#
+# The third example adds a Signed-off-by line to the message, that can
+# still be edited.  This is rarely a good idea.
+
+COMMIT_MSG_FILE=$1
+COMMIT_SOURCE=$2
+SHA1=$3
+
+/usr/bin/perl -i.bak -ne 'print unless(m/^. Please enter the commit message/..m/^#$/)' "$COMMIT_MSG_FILE"
+
+# case "$COMMIT_SOURCE,$SHA1" in
+#  ,|template,)
+#    /usr/bin/perl -i.bak -pe '
+#       print "\n" . `git diff --cached --name-status -r`
+# 	 if /^#/ && $first++ == 0' "$COMMIT_MSG_FILE" ;;
+#  *) ;;
+# esac
+
+# SOB=$(git var GIT_COMMITTER_IDENT | sed -n 's/^\(.*>\).*$/Signed-off-by: \1/p')
+# git interpret-trailers --in-place --trailer "$SOB" "$COMMIT_MSG_FILE"
+# if test -z "$COMMIT_SOURCE"
+# then
+#   /usr/bin/perl -i.bak -pe 'print "\n" if !$first_line++' "$COMMIT_MSG_FILE"
+# fi
+
+================
+File: frontend/.git/hooks/push-to-checkout.sample
+================
+#!/bin/sh
+
+# An example hook script to update a checked-out tree on a git push.
+#
+# This hook is invoked by git-receive-pack(1) when it reacts to git
+# push and updates reference(s) in its repository, and when the push
+# tries to update the branch that is currently checked out and the
+# receive.denyCurrentBranch configuration variable is set to
+# updateInstead.
+#
+# By default, such a push is refused if the working tree and the index
+# of the remote repository has any difference from the currently
+# checked out commit; when both the working tree and the index match
+# the current commit, they are updated to match the newly pushed tip
+# of the branch. This hook is to be used to override the default
+# behaviour; however the code below reimplements the default behaviour
+# as a starting point for convenient modification.
+#
+# The hook receives the commit with which the tip of the current
+# branch is going to be updated:
+commit=$1
+
+# It can exit with a non-zero status to refuse the push (when it does
+# so, it must not modify the index or the working tree).
+die () {
+	echo >&2 "$*"
+	exit 1
+}
+
+# Or it can make any necessary changes to the working tree and to the
+# index to bring them to the desired state when the tip of the current
+# branch is updated to the new commit, and exit with a zero status.
+#
+# For example, the hook can simply run git read-tree -u -m HEAD "$1"
+# in order to emulate git fetch that is run in the reverse direction
+# with git push, as the two-tree form of git read-tree -u -m is
+# essentially the same as git switch or git checkout that switches
+# branches while keeping the local changes in the working tree that do
+# not interfere with the difference between the branches.
+
+# The below is a more-or-less exact translation to shell of the C code
+# for the default behaviour for git's push-to-checkout hook defined in
+# the push_to_deploy() function in builtin/receive-pack.c.
+#
+# Note that the hook will be executed from the repository directory,
+# not from the working tree, so if you want to perform operations on
+# the working tree, you will have to adapt your code accordingly, e.g.
+# by adding "cd .." or using relative paths.
+
+if ! git update-index -q --ignore-submodules --refresh
+then
+	die "Up-to-date check failed"
+fi
+
+if ! git diff-files --quiet --ignore-submodules --
+then
+	die "Working directory has unstaged changes"
+fi
+
+# This is a rough translation of:
+#
+#   head_has_history() ? "HEAD" : EMPTY_TREE_SHA1_HEX
+if git cat-file -e HEAD 2>/dev/null
+then
+	head=HEAD
+else
+	head=$(git hash-object -t tree --stdin </dev/null)
+fi
+
+if ! git diff-index --quiet --cached --ignore-submodules $head --
+then
+	die "Working directory has staged changes"
+fi
+
+if ! git read-tree -u -m "$commit"
+then
+	die "Could not update working tree to new HEAD"
+fi
+
+================
+File: frontend/.git/hooks/update.sample
+================
+#!/bin/sh
+#
+# An example hook script to block unannotated tags from entering.
+# Called by "git receive-pack" with arguments: refname sha1-old sha1-new
+#
+# To enable this hook, rename this file to "update".
+#
+# Config
+# ------
+# hooks.allowunannotated
+#   This boolean sets whether unannotated tags will be allowed into the
+#   repository.  By default they won't be.
+# hooks.allowdeletetag
+#   This boolean sets whether deleting tags will be allowed in the
+#   repository.  By default they won't be.
+# hooks.allowmodifytag
+#   This boolean sets whether a tag may be modified after creation. By default
+#   it won't be.
+# hooks.allowdeletebranch
+#   This boolean sets whether deleting branches will be allowed in the
+#   repository.  By default they won't be.
+# hooks.denycreatebranch
+#   This boolean sets whether remotely creating branches will be denied
+#   in the repository.  By default this is allowed.
+#
+
+# --- Command line
+refname="$1"
+oldrev="$2"
+newrev="$3"
+
+# --- Safety check
+if [ -z "$GIT_DIR" ]; then
+	echo "Don't run this script from the command line." >&2
+	echo " (if you want, you could supply GIT_DIR then run" >&2
+	echo "  $0 <ref> <oldrev> <newrev>)" >&2
+	exit 1
+fi
+
+if [ -z "$refname" -o -z "$oldrev" -o -z "$newrev" ]; then
+	echo "usage: $0 <ref> <oldrev> <newrev>" >&2
+	exit 1
+fi
+
+# --- Config
+allowunannotated=$(git config --type=bool hooks.allowunannotated)
+allowdeletebranch=$(git config --type=bool hooks.allowdeletebranch)
+denycreatebranch=$(git config --type=bool hooks.denycreatebranch)
+allowdeletetag=$(git config --type=bool hooks.allowdeletetag)
+allowmodifytag=$(git config --type=bool hooks.allowmodifytag)
+
+# check for no description
+projectdesc=$(sed -e '1q' "$GIT_DIR/description")
+case "$projectdesc" in
+"Unnamed repository"* | "")
+	echo "*** Project description file hasn't been set" >&2
+	exit 1
+	;;
+esac
+
+# --- Check types
+# if $newrev is 0000...0000, it's a commit to delete a ref.
+zero=$(git hash-object --stdin </dev/null | tr '[0-9a-f]' '0')
+if [ "$newrev" = "$zero" ]; then
+	newrev_type=delete
+else
+	newrev_type=$(git cat-file -t $newrev)
+fi
+
+case "$refname","$newrev_type" in
+	refs/tags/*,commit)
+		# un-annotated tag
+		short_refname=${refname##refs/tags/}
+		if [ "$allowunannotated" != "true" ]; then
+			echo "*** The un-annotated tag, $short_refname, is not allowed in this repository" >&2
+			echo "*** Use 'git tag [ -a | -s ]' for tags you want to propagate." >&2
+			exit 1
+		fi
+		;;
+	refs/tags/*,delete)
+		# delete tag
+		if [ "$allowdeletetag" != "true" ]; then
+			echo "*** Deleting a tag is not allowed in this repository" >&2
+			exit 1
+		fi
+		;;
+	refs/tags/*,tag)
+		# annotated tag
+		if [ "$allowmodifytag" != "true" ] && git rev-parse $refname > /dev/null 2>&1
+		then
+			echo "*** Tag '$refname' already exists." >&2
+			echo "*** Modifying a tag is not allowed in this repository." >&2
+			exit 1
+		fi
+		;;
+	refs/heads/*,commit)
+		# branch
+		if [ "$oldrev" = "$zero" -a "$denycreatebranch" = "true" ]; then
+			echo "*** Creating a branch is not allowed in this repository" >&2
+			exit 1
+		fi
+		;;
+	refs/heads/*,delete)
+		# delete branch
+		if [ "$allowdeletebranch" != "true" ]; then
+			echo "*** Deleting a branch is not allowed in this repository" >&2
+			exit 1
+		fi
+		;;
+	refs/remotes/*,commit)
+		# tracking branch
+		;;
+	refs/remotes/*,delete)
+		# delete tracking branch
+		if [ "$allowdeletebranch" != "true" ]; then
+			echo "*** Deleting a tracking branch is not allowed in this repository" >&2
+			exit 1
+		fi
+		;;
+	*)
+		# Anything else (is there anything else?)
+		echo "*** Update hook: unknown type of update to ref $refname of type $newrev_type" >&2
+		exit 1
+		;;
+esac
+
+# --- Finished
+exit 0
+
+================
+File: frontend/.git/info/exclude
+================
+# git ls-files --others --exclude-from=.git/info/exclude
+# Lines that start with '#' are comments.
+# For a project mostly in C, the following would be a good set of
+# exclude patterns (uncomment them if you want to use them):
+# *.[oa]
+# *~
+
+================
+File: frontend/.git/refs/heads/main
+================
+039482c928bd8e3ca4f51702fca314003b7eec37
+
+================
+File: frontend/.git/COMMIT_EDITMSG
+================
+Initialize project using Create React App
+
+================
+File: frontend/.git/config
+================
+[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = false
+	logallrefupdates = true
+	ignorecase = true
+	precomposeunicode = true
+
+================
+File: frontend/.git/description
+================
+Unnamed repository; edit this file 'description' to name the repository.
+
+================
+File: frontend/.git/HEAD
+================
+ref: refs/heads/main
+
+================
+File: frontend/public/index.html
+================
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%PUBLIC_URL%/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#000000" />
+    <meta
+      name="description"
+      content="Web site created using create-react-app"
+    />
+    <link rel="apple-touch-icon" href="%PUBLIC_URL%/logo192.png" />
+    <!--
+      manifest.json provides metadata used when your web app is installed on a
+      user's mobile device or desktop. See https://developers.google.com/web/fundamentals/web-app-manifest/
+    -->
+    <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
+    <!--
+      Notice the use of %PUBLIC_URL% in the tags above.
+      It will be replaced with the URL of the `public` folder during the build.
+      Only files inside the `public` folder can be referenced from the HTML.
+
+      Unlike "/favicon.ico" or "favicon.ico", "%PUBLIC_URL%/favicon.ico" will
+      work correctly both with client-side routing and a non-root public URL.
+      Learn how to configure a non-root public URL by running `npm run build`.
+    -->
+    <title>React App</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+    <!--
+      This HTML file is a template.
+      If you open it directly in the browser, you will see an empty page.
+
+      You can add webfonts, meta tags, or analytics to this file.
+      The build step will place the bundled scripts into the <body> tag.
+
+      To begin the development, run `npm start` or `yarn start`.
+      To create a production bundle, use `npm run build` or `yarn build`.
+    -->
+  </body>
+</html>
+
+================
+File: frontend/public/manifest.json
+================
+{
+  "short_name": "React App",
+  "name": "Create React App Sample",
+  "icons": [
+    {
+      "src": "favicon.ico",
+      "sizes": "64x64 32x32 24x24 16x16",
+      "type": "image/x-icon"
+    },
+    {
+      "src": "logo192.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "logo512.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#000000",
+  "background_color": "#ffffff"
+}
+
+================
+File: frontend/public/robots.txt
+================
+# https://www.robotstxt.org/robotstxt.html
+User-agent: *
+Disallow:
+
+================
+File: frontend/src/components/Dashboard.tsx
+================
+import React, { useState, useEffect } from 'react';
+import { MapContainer, TileLayer, Marker, Popup } from 'react-leaflet';
+import styled from 'styled-components';
+import 'leaflet/dist/leaflet.css';
+import L from 'leaflet';
+import { Incident, Unit, UnitRecommendation } from '../types';
+import { incidentsApi, unitsApi } from '../services/api';
+import { socketService } from '../services/socket';
+import axios from 'axios';
+
+// Fix Leaflet icon issue
+delete (L.Icon.Default.prototype as any)._getIconUrl;
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: require('leaflet/dist/images/marker-icon-2x.png'),
+  iconUrl: require('leaflet/dist/images/marker-icon.png'),
+  shadowUrl: require('leaflet/dist/images/marker-shadow.png'),
+});
+
+// Custom icons for different unit types
+const unitIcons = {
+  AMBULANCE: new L.Icon({
+    iconUrl: 'https://cdn-icons-png.flaticon.com/128/2869/2869842.png',
+    iconSize: [32, 32],
+    iconAnchor: [16, 32],
+    popupAnchor: [0, -32]
+  }),
+  FIRE_ENGINE: new L.Icon({
+    iconUrl: 'https://cdn-icons-png.flaticon.com/128/4197/4197848.png',
+    iconSize: [32, 32],
+    iconAnchor: [16, 32],
+    popupAnchor: [0, -32]
+  }),
+  POLICE_CAR: new L.Icon({
+    iconUrl: 'https://cdn-icons-png.flaticon.com/128/2316/2316499.png',
+    iconSize: [32, 32],
+    iconAnchor: [16, 32],
+    popupAnchor: [0, -32]
+  }),
+  OTHER: new L.Icon({
+    iconUrl: 'https://cdn-icons-png.flaticon.com/128/7193/7193086.png',
+    iconSize: [32, 32],
+    iconAnchor: [16, 32],
+    popupAnchor: [0, -32]
+  })
+};
+
+// Incident icons based on type
+const incidentIcons = {
+  MEDICAL: new L.Icon({
+    iconUrl: 'https://cdn-icons-png.flaticon.com/128/2966/2966327.png',
+    iconSize: [32, 32],
+    iconAnchor: [16, 32],
+    popupAnchor: [0, -32]
+  }),
+  FIRE: new L.Icon({
+    iconUrl: 'https://cdn-icons-png.flaticon.com/128/785/785116.png',
+    iconSize: [32, 32],
+    iconAnchor: [16, 32],
+    popupAnchor: [0, -32]
+  }),
+  POLICE: new L.Icon({
+    iconUrl: 'https://cdn-icons-png.flaticon.com/128/3815/3815523.png',
+    iconSize: [32, 32],
+    iconAnchor: [16, 32],
+    popupAnchor: [0, -32]
+  }),
+  OTHER: new L.Icon({
+    iconUrl: 'https://cdn-icons-png.flaticon.com/128/159/159469.png',
+    iconSize: [32, 32],
+    iconAnchor: [16, 32],
+    popupAnchor: [0, -32]
+  })
+};
+
+const DashboardContainer = styled.div`
+  display: flex;
+  height: calc(100vh - 70px);
+`;
+
+const MapSection = styled.div`
+  flex: 1;
+  height: 100%;
+`;
+
+const SidePanel = styled.div`
+  width: 350px;
+  background-color: #f8f9fa;
+  overflow-y: auto;
+  box-shadow: -2px 0 5px rgba(0, 0, 0, 0.1);
+`;
+
+const TabContainer = styled.div`
+  display: flex;
+  border-bottom: 1px solid #dee2e6;
+`;
+
+const Tab = styled.button<{ active: boolean }>`
+  padding: 1rem;
+  border: none;
+  background: ${props => props.active ? '#fff' : '#f8f9fa'};
+  font-weight: ${props => props.active ? 'bold' : 'normal'};
+  border-bottom: ${props => props.active ? '2px solid #007bff' : 'none'};
+  flex: 1;
+  cursor: pointer;
+  
+  &:hover {
+    background-color: #e9ecef;
+  }
+`;
+
+const TabContent = styled.div`
+  padding: 1rem;
+`;
+
+const IncidentCard = styled.div<{ priority: number, active: boolean, status: string }>`
+  margin-bottom: 1rem;
+  padding: 1rem;
+  background-color: #fff;
+  border-radius: 0.25rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12), 0 1px 2px rgba(0, 0, 0, 0.24);
+  cursor: pointer;
+  
+  ${props => {
+    switch (props.priority) {
+      case 5:
+        return `
+          border-left: 4px solid #dc3545;
+        `;
+      case 4:
+        return `
+          border-left: 4px solid #fd7e14;
+        `;
+      case 3:
+        return `
+          border-left: 4px solid #ffc107;
+        `;
+      case 2:
+        return `
+          border-left: 4px solid #28a745;
+        `;
+      default:
+        return `
+          border-left: 4px solid #6c757d;
+        `;
+    }
+  }};
+  ${props => props.active && `
+    border-left: 5px solid #007bff;
+  `}
+  ${props => props.status === 'PENDING' && `
+    border-left: 5px solid #ffc107;
+  `}
+  ${props => props.status === 'DISPATCHED' && `
+    border-left: 5px solid #28a745;
+  `}
+  ${props => props.status === 'EN_ROUTE' && `
+    border-left: 5px solid #17a2b8;
+  `}
+  ${props => props.status === 'ON_SCENE' && `
+    border-left: 5px solid #fd7e14;
+  `}
+  ${props => props.status === 'RESOLVED' && `
+    border-left: 5px solid #28a745;
+  `}
+`;
+
+const UnitCard = styled.div<{ status: string }>`
+  margin-bottom: 1rem;
+  padding: 1rem;
+  border-radius: 4px;
+  background-color: white;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  border-left: 5px solid ${props => {
+    switch (props.status) {
+      case 'AVAILABLE': return '#28a745';
+      case 'DISPATCHED': return '#ffc107';
+      case 'EN_ROUTE': return '#17a2b8';
+      case 'ON_SCENE': return '#fd7e14';
+      case 'RETURNING': return '#6c757d';
+      case 'OUT_OF_SERVICE': return '#dc3545';
+      default: return '#6c757d';
+    }
+  }};
+`;
+
+const Button = styled.button`
+  padding: 0.5rem 1rem;
+  border: none;
+  border-radius: 4px;
+  background-color: #007bff;
+  color: white;
+  cursor: pointer;
+  margin-top: 0.5rem;
+  
+  &:hover {
+    background-color: #0069d9;
+  }
+  
+  &:disabled {
+    background-color: #6c757d;
+    cursor: not-allowed;
+  }
+`;
+
+const Dashboard: React.FC = () => {
+  const [incidents, setIncidents] = useState<Incident[]>([]);
+  const [units, setUnits] = useState<Unit[]>([]);
+  const [activeTab, setActiveTab] = useState<'incidents' | 'units'>('incidents');
+  const [selectedIncident, setSelectedIncident] = useState<Incident | null>(null);
+  const [recommendations, setRecommendations] = useState<UnitRecommendation[]>([]);
+  const [recommendationId, setRecommendationId] = useState<string | null>(null);
+  const [incidentFilter, setIncidentFilter] = useState<'ALL' | 'PENDING' | 'DISPATCHED' | 'EN_ROUTE' | 'ON_SCENE' | 'RESOLVED'>('ALL');
+  
+  // San Francisco center coordinates as default
+  const defaultCenter: [number, number] = [37.7749, -122.4194];
+  
+  useEffect(() => {
+    // Fetch initial data
+    const fetchData = async () => {
+      try {
+        const [incidentsData, unitsData] = await Promise.all([
+          incidentsApi.getAll(),
+          unitsApi.getAll()
+        ]);
+        
+        setIncidents(incidentsData);
+        setUnits(unitsData);
+      } catch (error) {
+        console.error('Error fetching data:', error);
+      }
+    };
+    
+    fetchData();
+    
+    // Connect to socket server
+    socketService.connect();
+    
+    // Set up socket event listeners
+    const unsubscribeNewIncident = socketService.onNewIncident((incident) => {
+      setIncidents(prev => [...prev, incident]);
+    });
+    
+    const unsubscribeUnitLocation = socketService.onUnitLocationChange((data) => {
+      setUnits(prev => prev.map(unit => 
+        unit._id === data.unitId 
+          ? { ...unit, location: { ...unit.location, coordinates: data.coordinates } }
+          : unit
+      ));
+    });
+    
+    const unsubscribeUnitDispatched = socketService.onUnitDispatched((data) => {
+      // Update unit status
+      setUnits(prev => prev.map(unit => 
+        unit._id === data.unitId 
+          ? { ...unit, status: 'DISPATCHED', currentIncident: data.incidentId }
+          : unit
+      ));
+      
+      // Update incident dispatched units
+      setIncidents(prev => prev.map(incident => 
+        incident._id === data.incidentId 
+          ? { 
+              ...incident, 
+              status: 'DISPATCHED', 
+              dispatchedUnits: [...incident.dispatchedUnits, data.unitId] 
+            }
+          : incident
+      ));
+      
+      // Clear recommendations if this was the selected incident
+      if (selectedIncident?._id === data.incidentId) {
+        setRecommendations([]);
+      }
+    });
+    
+    // Cleanup on unmount
+    return () => {
+      socketService.disconnect();
+      unsubscribeNewIncident();
+      unsubscribeUnitLocation();
+      unsubscribeUnitDispatched();
+    };
+  }, [selectedIncident]);
+  
+  const handleSelectIncident = async (incident: Incident) => {
+    setSelectedIncident(incident);
+    
+    // Get AI recommendations for this incident
+    try {
+      const recommendations = await incidentsApi.recommendUnits(incident._id);
+      setRecommendations(recommendations);
+      
+      // Get the latest recommendation ID for this incident
+      const response = await axios.get(`http://localhost:5001/api/incidents/${incident._id}/recommendations`);
+      if (response.data && response.data.length > 0) {
+        setRecommendationId(response.data[0]._id);
+      }
+    } catch (error) {
+      console.error('Error getting unit recommendations:', error);
+    }
+  };
+  
+  const handleDispatchUnit = async (unitId: string, incidentId: string) => {
+    try {
+      // Optimistic UI update - update state first before API call
+      // Update unit status
+      setUnits(prev => prev.map(unit => 
+        unit._id === unitId 
+          ? { ...unit, status: 'DISPATCHED', currentIncident: incidentId }
+          : unit
+      ));
+      
+      // Update incident dispatched units
+      setIncidents(prev => prev.map(incident => 
+        incident._id === incidentId 
+          ? { 
+              ...incident, 
+              status: 'DISPATCHED', 
+              dispatchedUnits: [...incident.dispatchedUnits, unitId] 
+            }
+          : incident
+      ));
+      
+      // Then make API call
+      await unitsApi.assignToIncident(unitId, incidentId);
+      socketService.dispatchUnit(unitId, incidentId);
+    } catch (error) {
+      console.error('Error dispatching unit:', error);
+      // Revert optimistic updates on error
+      setUnits(prev => prev.map(unit => 
+        unit._id === unitId 
+          ? { ...unit, status: 'AVAILABLE', currentIncident: null }
+          : unit
+      ));
+      
+      setIncidents(prev => prev.map(incident => 
+        incident._id === incidentId 
+          ? { 
+              ...incident, 
+              status: 'PENDING', 
+              dispatchedUnits: incident.dispatchedUnits.filter(id => id !== unitId)
+            }
+          : incident
+      ));
+    }
+  };
+  
+  const acceptRecommendation = async (unitId: string, incidentId: string) => {
+    if (!recommendationId) return;
+    
+    try {
+      // Optimistic UI update - update state first before API call
+      // Update unit status
+      setUnits(prev => prev.map(unit => 
+        unit._id === unitId 
+          ? { ...unit, status: 'DISPATCHED', currentIncident: incidentId }
+          : unit
+      ));
+      
+      // Update incident dispatched units
+      setIncidents(prev => prev.map(incident => 
+        incident._id === incidentId 
+          ? { 
+              ...incident, 
+              status: 'DISPATCHED', 
+              dispatchedUnits: [...incident.dispatchedUnits, unitId] 
+            }
+          : incident
+      ));
+      
+      // Then make API call
+      await incidentsApi.acceptRecommendation(recommendationId, unitId);
+      
+    } catch (error) {
+      console.error('Error accepting recommendation:', error);
+      // Revert optimistic updates on error
+      setUnits(prev => prev.map(unit => 
+        unit._id === unitId 
+          ? { ...unit, status: 'AVAILABLE', currentIncident: null }
+          : unit
+      ));
+      
+      setIncidents(prev => prev.map(incident => 
+        incident._id === incidentId 
+          ? { 
+              ...incident, 
+              status: 'PENDING', 
+              dispatchedUnits: incident.dispatchedUnits.filter(id => id !== unitId)
+            }
+          : incident
+      ));
+    }
+  };
+  
+  // Filter incidents based on the selected filter
+  const filteredIncidents = incidents.filter(incident => 
+    incidentFilter === 'ALL' || incident.status === incidentFilter
+  );
+  
+  return (
+    <DashboardContainer>
+      <MapSection>
+        <MapContainer 
+          center={defaultCenter} 
+          zoom={13} 
+          style={{ height: '100%', width: '100%' }}
+        >
+          <TileLayer
+            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+          />
+          
+          {/* Render incidents on map */}
+          {incidents.map(incident => (
+            <Marker 
+              key={incident._id}
+              position={[incident.location.coordinates[1], incident.location.coordinates[0]]} 
+              icon={incidentIcons[incident.type]}
+              eventHandlers={{
+                click: () => handleSelectIncident(incident)
+              }}
+            >
+              <Popup>
+                <div>
+                  <h3>{incident.type} - Priority {incident.priority}</h3>
+                  <p>{incident.description}</p>
+                  <p>Status: {incident.status}</p>
+                  <p>Address: {incident.location.address}</p>
+                </div>
+              </Popup>
+            </Marker>
+          ))}
+          
+          {/* Render units on map */}
+          {units.map(unit => (
+            <Marker 
+              key={unit._id}
+              position={[unit.location.coordinates[1], unit.location.coordinates[0]]} 
+              icon={unitIcons[unit.type]}
+            >
+              <Popup>
+                <div>
+                  <h3>{unit.callSign}</h3>
+                  <p>Type: {unit.type}</p>
+                  <p>Status: {unit.status}</p>
+                  {unit.currentIncident && <p>Assigned to: {unit.currentIncident}</p>}
+                </div>
+              </Popup>
+            </Marker>
+          ))}
+        </MapContainer>
+      </MapSection>
+      
+      <SidePanel>
+        <TabContainer>
+          <Tab 
+            active={activeTab === 'incidents'} 
+            onClick={() => setActiveTab('incidents')}
+          >
+            Incidents
+          </Tab>
+          <Tab 
+            active={activeTab === 'units'} 
+            onClick={() => setActiveTab('units')}
+          >
+            Units
+          </Tab>
+        </TabContainer>
+        
+        <TabContent>
+          {activeTab === 'incidents' ? (
+            <>
+              {/* Show incident recommendations if an incident is selected */}
+              {selectedIncident && recommendations.length > 0 && (
+                <div>
+                  <h3>Recommended Units</h3>
+                  {recommendations.map(rec => {
+                    const unit = units.find(u => u._id === rec.unit_id);
+                    
+                    return (
+                      <UnitCard key={rec.unit_id} status={unit?.status || 'UNKNOWN'}>
+                        <h4>{rec.call_sign}</h4>
+                        <p>Type: {rec.type}</p>
+                        <p>Distance: {rec.distance.toFixed(2)} km</p>
+                        <p>Score: {rec.score.toFixed(2)}</p>
+                        <div style={{ display: 'flex', gap: '10px' }}>
+                          <Button 
+                            onClick={() => handleDispatchUnit(rec.unit_id, selectedIncident._id)}
+                            disabled={unit?.status !== 'AVAILABLE'}
+                          >
+                            Dispatch
+                          </Button>
+                          <Button 
+                            onClick={() => acceptRecommendation(rec.unit_id, selectedIncident._id)}
+                            disabled={unit?.status !== 'AVAILABLE' || !recommendationId}
+                            style={{ backgroundColor: '#28a745' }}
+                          >
+                            Accept
+                          </Button>
+                        </div>
+                      </UnitCard>
+                    );
+                  })}
+                </div>
+              )}
+              
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+                <h3>All Incidents</h3>
+                <select 
+                  value={incidentFilter}
+                  onChange={(e) => setIncidentFilter(e.target.value as any)}
+                  style={{
+                    padding: '5px',
+                    borderRadius: '4px',
+                    border: '1px solid #ced4da'
+                  }}
+                >
+                  <option value="ALL">All Incidents</option>
+                  <option value="PENDING">Pending</option>
+                  <option value="DISPATCHED">Dispatched</option>
+                  <option value="EN_ROUTE">En Route</option>
+                  <option value="ON_SCENE">On Scene</option>
+                  <option value="RESOLVED">Resolved</option>
+                </select>
+              </div>
+              
+              {filteredIncidents.map(incident => (
+                <IncidentCard 
+                  key={incident._id}
+                  priority={incident.priority}
+                  active={selectedIncident?._id === incident._id}
+                  status={incident.status}
+                  onClick={() => handleSelectIncident(incident)}
+                >
+                  <h4>{incident.type} - Priority {incident.priority}</h4>
+                  <p>{incident.description}</p>
+                  <p>Status: {incident.status}</p>
+                  <p>Address: {incident.location.address}</p>
+                  
+                  {/* Add direct dispatch buttons for testing */}
+                  <div style={{ marginTop: '10px' }}>
+                    <h5>Dispatch Unit:</h5>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '5px' }}>
+                      {units
+                        .filter(unit => unit.status === 'AVAILABLE')
+                        .map(unit => (
+                          <Button 
+                            key={unit._id}
+                            onClick={(e) => {
+                              e.stopPropagation(); // Prevent card click
+                              handleDispatchUnit(unit._id, incident._id);
+                            }}
+                            style={{ 
+                              margin: '2px', 
+                              padding: '5px 10px',
+                              fontSize: '12px',
+                              backgroundColor: 
+                                unit.type === 'AMBULANCE' ? '#dc3545' : 
+                                unit.type === 'FIRE_ENGINE' ? '#fd7e14' : 
+                                '#007bff'
+                            }}
+                          >
+                            {unit.callSign}
+                          </Button>
+                        ))
+                      }
+                    </div>
+                  </div>
+                </IncidentCard>
+              ))}
+            </>
+          ) : (
+            <>
+              <h3>Units</h3>
+              {units.map(unit => (
+                <UnitCard key={unit._id} status={unit.status}>
+                  <h4>{unit.callSign}</h4>
+                  <p>Type: {unit.type}</p>
+                  <p>Status: {unit.status}</p>
+                  {unit.capabilities.length > 0 && (
+                    <p>Capabilities: {unit.capabilities.join(', ')}</p>
+                  )}
+                  {unit.currentIncident && <p>Assigned to: {unit.currentIncident}</p>}
+                </UnitCard>
+              ))}
+            </>
+          )}
+        </TabContent>
+      </SidePanel>
+    </DashboardContainer>
+  );
+};
+
+export default Dashboard;
+
+================
+File: frontend/src/components/Header.tsx
+================
+import React from 'react';
+import styled from 'styled-components';
+
+const HeaderContainer = styled.header`
+  display: flex;
+  align-items: center;
+  padding: 0 2rem;
+  height: 70px;
+  background-color: #2c3e50;
+  color: white;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+`;
+
+const Logo = styled.h1`
+  font-size: 24px;
+  margin: 0;
+  font-weight: 600;
+`;
+
+const Header: React.FC = () => {
+  return (
+    <HeaderContainer>
+      <Logo>RapidResponse AI-CAD</Logo>
+    </HeaderContainer>
+  );
+};
+
+export default Header;
+
+================
+File: frontend/src/services/api.ts
+================
+import axios from 'axios';
+import { Incident, Unit, UnitRecommendation } from '../types';
+
+const API_URL = 'http://localhost:5001/api';
+
+// Incidents API
+export const incidentsApi = {
+  getAll: async (): Promise<Incident[]> => {
+    const response = await axios.get(`${API_URL}/incidents`);
+    return response.data;
+  },
+  
+  getById: async (id: string): Promise<Incident> => {
+    const response = await axios.get(`${API_URL}/incidents/${id}`);
+    return response.data;
+  },
+  
+  create: async (incident: Omit<Incident, '_id' | 'status' | 'dispatchedUnits' | 'createdAt' | 'updatedAt'>): Promise<Incident> => {
+    const response = await axios.post(`${API_URL}/incidents`, incident);
+    return response.data;
+  },
+  
+  updateStatus: async (id: string, status: Incident['status']): Promise<Incident> => {
+    const response = await axios.patch(`${API_URL}/incidents/${id}/status`, { status });
+    return response.data;
+  },
+  
+  recommendUnits: async (id: string): Promise<UnitRecommendation[]> => {
+    const response = await axios.post(`${API_URL}/incidents/${id}/recommend-units`);
+    return response.data;
+  },
+  
+  dispatchUnit: async (incidentId: string, unitId: string): Promise<Incident> => {
+    const response = await axios.post(`${API_URL}/incidents/${incidentId}/dispatch`, { unitId });
+    return response.data;
+  },
+  
+  acceptRecommendation: async (recommendationId: string, unitId: string): Promise<Incident> => {
+    const response = await axios.post(`${API_URL}/recommendations/${recommendationId}/accept`, { unitId });
+    return response.data;
+  }
+};
+
+// Units API
+export const unitsApi = {
+  getAll: async (): Promise<Unit[]> => {
+    const response = await axios.get(`${API_URL}/units`);
+    return response.data;
+  },
+  
+  getById: async (id: string): Promise<Unit> => {
+    const response = await axios.get(`${API_URL}/units/${id}`);
+    return response.data;
+  },
+  
+  create: async (unit: Omit<Unit, '_id' | 'status' | 'currentIncident' | 'lastUpdated'>): Promise<Unit> => {
+    const response = await axios.post(`${API_URL}/units`, unit);
+    return response.data;
+  },
+  
+  updateStatus: async (id: string, status: Unit['status']): Promise<Unit> => {
+    const response = await axios.patch(`${API_URL}/units/${id}/status`, { status });
+    return response.data;
+  },
+  
+  updateLocation: async (id: string, coordinates: [number, number]): Promise<Unit> => {
+    const response = await axios.patch(`${API_URL}/units/${id}/location`, { coordinates });
+    return response.data;
+  },
+  
+  getNearestAvailable: async (longitude: number, latitude: number, maxDistance = 20000, limit = 5): Promise<Unit[]> => {
+    const response = await axios.get(`${API_URL}/units/available/nearest`, {
+      params: { longitude, latitude, maxDistance, limit }
+    });
+    return response.data;
+  },
+  
+  assignToIncident: async (unitId: string, incidentId: string): Promise<Unit> => {
+    const response = await axios.post(`${API_URL}/units/${unitId}/assign`, { incidentId });
+    return response.data;
+  }
+};
+
+================
+File: frontend/src/services/socket.ts
+================
+import io from "socket.io-client";
+import { Incident } from '../types';
+
+const SOCKET_URL = 'http://localhost:5001';
+
+class SocketService {
+  private socket: ReturnType<typeof io> | null = null;
+  private incidentListeners: ((incident: Incident) => void)[] = [];
+  private unitLocationListeners: ((unit: { unitId: string, coordinates: [number, number] }) => void)[] = [];
+  private unitDispatchListeners: ((data: { unitId: string, incidentId: string }) => void)[] = [];
+
+  connect() {
+    this.socket = io(SOCKET_URL);
+    
+    this.socket.on('connect', () => {
+      console.log('Connected to WebSocket server');
+    });
+    
+    this.socket.on('disconnect', () => {
+      console.log('Disconnected from WebSocket server');
+    });
+    
+    // Listen for new incidents
+    this.socket.on('incident_created', (incident: Incident) => {
+      this.incidentListeners.forEach(listener => listener(incident));
+    });
+    
+    // Listen for unit location updates
+    this.socket.on('unit_location_changed', (data: { unitId: string, coordinates: [number, number] }) => {
+      this.unitLocationListeners.forEach(listener => listener(data));
+    });
+    
+    // Listen for unit dispatches
+    this.socket.on('unit_dispatched', (data: { unitId: string, incidentId: string }) => {
+      this.unitDispatchListeners.forEach(listener => listener(data));
+    });
+  }
+  
+  disconnect() {
+    if (this.socket) {
+      this.socket.disconnect();
+      this.socket = null;
+    }
+  }
+  
+  // Send unit location update
+  updateUnitLocation(unitId: string, coordinates: [number, number]) {
+    if (this.socket) {
+      this.socket.emit('unit_location_update', { unitId, coordinates });
+    }
+  }
+  
+  // Create a new incident
+  createIncident(incident: Incident) {
+    if (this.socket) {
+      this.socket.emit('new_incident', incident);
+    }
+  }
+  
+  // Dispatch a unit to an incident
+  dispatchUnit(unitId: string, incidentId: string) {
+    if (this.socket) {
+      this.socket.emit('dispatch_unit', { unitId, incidentId });
+    }
+  }
+  
+  // Register event listeners
+  onNewIncident(callback: (incident: Incident) => void) {
+    this.incidentListeners.push(callback);
+    return () => {
+      this.incidentListeners = this.incidentListeners.filter(cb => cb !== callback);
+    };
+  }
+  
+  onUnitLocationChange(callback: (data: { unitId: string, coordinates: [number, number] }) => void) {
+    this.unitLocationListeners.push(callback);
+    return () => {
+      this.unitLocationListeners = this.unitLocationListeners.filter(cb => cb !== callback);
+    };
+  }
+  
+  onUnitDispatched(callback: (data: { unitId: string, incidentId: string }) => void) {
+    this.unitDispatchListeners.push(callback);
+    return () => {
+      this.unitDispatchListeners = this.unitDispatchListeners.filter(cb => cb !== callback);
+    };
+  }
+}
+
+// Export singleton instance
+export const socketService = new SocketService();
+
+================
+File: frontend/src/types/index.ts
+================
+// Incident type
+export interface Incident {
+  _id: string;
+  type: 'MEDICAL' | 'FIRE' | 'POLICE' | 'OTHER';
+  priority: number;
+  location: {
+    type: string;
+    coordinates: [number, number]; // [longitude, latitude]
+    address: string;
+  };
+  description: string;
+  status: 'PENDING' | 'DISPATCHED' | 'EN_ROUTE' | 'ON_SCENE' | 'RESOLVED';
+  dispatchedUnits: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+// Emergency Unit type
+export interface Unit {
+  _id: string;
+  callSign: string;
+  type: 'AMBULANCE' | 'FIRE_ENGINE' | 'POLICE_CAR' | 'OTHER';
+  capabilities: string[];
+  status: 'AVAILABLE' | 'DISPATCHED' | 'EN_ROUTE' | 'ON_SCENE' | 'RETURNING' | 'OUT_OF_SERVICE';
+  location: {
+    type: string;
+    coordinates: [number, number]; // [longitude, latitude]
+  };
+  currentIncident: string | null;
+  lastUpdated: string;
+}
+
+// Unit Recommendation from AI model
+export interface UnitRecommendation {
+  unit_id: string;
+  call_sign: string;
+  type: string;
+  distance: number;
+  score: number;
+}
+
+================
+File: frontend/src/App.css
+================
+.App {
+  text-align: center;
+}
+
+.App-logo {
+  height: 40vmin;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .App-logo {
+    animation: App-logo-spin infinite 20s linear;
+  }
+}
+
+.App-header {
+  background-color: #282c34;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  font-size: calc(10px + 2vmin);
+  color: white;
+}
+
+.App-link {
+  color: #61dafb;
+}
+
+@keyframes App-logo-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+================
+File: frontend/src/App.test.tsx
+================
+import React from 'react';
+import { render, screen } from '@testing-library/react';
+import App from './App';
+
+test('renders learn react link', () => {
+  render(<App />);
+  const linkElement = screen.getByText(/learn react/i);
+  expect(linkElement).toBeInTheDocument();
+});
+
+================
+File: frontend/src/App.tsx
+================
+import React from 'react';
+import styled from 'styled-components';
+import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
+import Dashboard from './components/Dashboard';
+import Header from './components/Header';
+import './App.css';
+
+const AppContainer = styled.div`
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background-color: #f5f5f5;
+`;
+
+function App() {
+  return (
+    <Router>
+      <AppContainer>
+        <Header />
+        <Routes>
+          <Route path="/" element={<Dashboard />} />
+        </Routes>
+      </AppContainer>
+    </Router>
+  );
+}
+
+export default App;
+
+================
+File: frontend/src/index.css
+================
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}
+
+================
+File: frontend/src/index.tsx
+================
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import './index.css';
+import App from './App';
+import reportWebVitals from './reportWebVitals';
+
+const root = ReactDOM.createRoot(
+  document.getElementById('root') as HTMLElement
+);
+root.render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+
+// If you want to start measuring performance in your app, pass a function
+// to log results (for example: reportWebVitals(console.log))
+// or send to an analytics endpoint. Learn more: https://bit.ly/CRA-vitals
+reportWebVitals();
+
+================
+File: frontend/src/logo.svg
+================
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 841.9 595.3"><g fill="#61DAFB"><path d="M666.3 296.5c0-32.5-40.7-63.3-103.1-82.4 14.4-63.6 8-114.2-20.2-130.4-6.5-3.8-14.1-5.6-22.4-5.6v22.3c4.6 0 8.3.9 11.4 2.6 13.6 7.8 19.5 37.5 14.9 75.7-1.1 9.4-2.9 19.3-5.1 29.4-19.6-4.8-41-8.5-63.5-10.9-13.5-18.5-27.5-35.3-41.6-50 32.6-30.3 63.2-46.9 84-46.9V78c-27.5 0-63.5 19.6-99.9 53.6-36.4-33.8-72.4-53.2-99.9-53.2v22.3c20.7 0 51.4 16.5 84 46.6-14 14.7-28 31.4-41.3 49.9-22.6 2.4-44 6.1-63.6 11-2.3-10-4-19.7-5.2-29-4.7-38.2 1.1-67.9 14.6-75.8 3-1.8 6.9-2.6 11.5-2.6V78.5c-8.4 0-16 1.8-22.6 5.6-28.1 16.2-34.4 66.7-19.9 130.1-62.2 19.2-102.7 49.9-102.7 82.3 0 32.5 40.7 63.3 103.1 82.4-14.4 63.6-8 114.2 20.2 130.4 6.5 3.8 14.1 5.6 22.5 5.6 27.5 0 63.5-19.6 99.9-53.6 36.4 33.8 72.4 53.2 99.9 53.2 8.4 0 16-1.8 22.6-5.6 28.1-16.2 34.4-66.7 19.9-130.1 62-19.1 102.5-49.9 102.5-82.3zm-130.2-66.7c-3.7 12.9-8.3 26.2-13.5 39.5-4.1-8-8.4-16-13.1-24-4.6-8-9.5-15.8-14.4-23.4 14.2 2.1 27.9 4.7 41 7.9zm-45.8 106.5c-7.8 13.5-15.8 26.3-24.1 38.2-14.9 1.3-30 2-45.2 2-15.1 0-30.2-.7-45-1.9-8.3-11.9-16.4-24.6-24.2-38-7.6-13.1-14.5-26.4-20.8-39.8 6.2-13.4 13.2-26.8 20.7-39.9 7.8-13.5 15.8-26.3 24.1-38.2 14.9-1.3 30-2 45.2-2 15.1 0 30.2.7 45 1.9 8.3 11.9 16.4 24.6 24.2 38 7.6 13.1 14.5 26.4 20.8 39.8-6.3 13.4-13.2 26.8-20.7 39.9zm32.3-13c5.4 13.4 10 26.8 13.8 39.8-13.1 3.2-26.9 5.9-41.2 8 4.9-7.7 9.8-15.6 14.4-23.7 4.6-8 8.9-16.1 13-24.1zM421.2 430c-9.3-9.6-18.6-20.3-27.8-32 9 .4 18.2.7 27.5.7 9.4 0 18.7-.2 27.8-.7-9 11.7-18.3 22.4-27.5 32zm-74.4-58.9c-14.2-2.1-27.9-4.7-41-7.9 3.7-12.9 8.3-26.2 13.5-39.5 4.1 8 8.4 16 13.1 24 4.7 8 9.5 15.8 14.4 23.4zM420.7 163c9.3 9.6 18.6 20.3 27.8 32-9-.4-18.2-.7-27.5-.7-9.4 0-18.7.2-27.8.7 9-11.7 18.3-22.4 27.5-32zm-74 58.9c-4.9 7.7-9.8 15.6-14.4 23.7-4.6 8-8.9 16-13 24-5.4-13.4-10-26.8-13.8-39.8 13.1-3.1 26.9-5.8 41.2-7.9zm-90.5 125.2c-35.4-15.1-58.3-34.9-58.3-50.6 0-15.7 22.9-35.6 58.3-50.6 8.6-3.7 18-7 27.7-10.1 5.7 19.6 13.2 40 22.5 60.9-9.2 20.8-16.6 41.1-22.2 60.6-9.9-3.1-19.3-6.5-28-10.2zM310 490c-13.6-7.8-19.5-37.5-14.9-75.7 1.1-9.4 2.9-19.3 5.1-29.4 19.6 4.8 41 8.5 63.5 10.9 13.5 18.5 27.5 35.3 41.6 50-32.6 30.3-63.2 46.9-84 46.9-4.5-.1-8.3-1-11.3-2.7zm237.2-76.2c4.7 38.2-1.1 67.9-14.6 75.8-3 1.8-6.9 2.6-11.5 2.6-20.7 0-51.4-16.5-84-46.6 14-14.7 28-31.4 41.3-49.9 22.6-2.4 44-6.1 63.6-11 2.3 10.1 4.1 19.8 5.2 29.1zm38.5-66.7c-8.6 3.7-18 7-27.7 10.1-5.7-19.6-13.2-40-22.5-60.9 9.2-20.8 16.6-41.1 22.2-60.6 9.9 3.1 19.3 6.5 28.1 10.2 35.4 15.1 58.3 34.9 58.3 50.6-.1 15.7-23 35.6-58.4 50.6zM320.8 78.4z"/><circle cx="420.9" cy="296.5" r="45.7"/><path d="M520.5 78.1z"/></g></svg>
+
+================
+File: frontend/src/react-app-env.d.ts
+================
+/// <reference types="react-scripts" />
+
+================
+File: frontend/src/reportWebVitals.ts
+================
+import { ReportHandler } from 'web-vitals';
+
+const reportWebVitals = (onPerfEntry?: ReportHandler) => {
+  if (onPerfEntry && onPerfEntry instanceof Function) {
+    import('web-vitals').then(({ getCLS, getFID, getFCP, getLCP, getTTFB }) => {
+      getCLS(onPerfEntry);
+      getFID(onPerfEntry);
+      getFCP(onPerfEntry);
+      getLCP(onPerfEntry);
+      getTTFB(onPerfEntry);
+    });
+  }
+};
+
+export default reportWebVitals;
+
+================
+File: frontend/src/setupTests.ts
+================
+// jest-dom adds custom jest matchers for asserting on DOM nodes.
+// allows you to do things like:
+// expect(element).toHaveTextContent(/react/i)
+// learn more: https://github.com/testing-library/jest-dom
+import '@testing-library/jest-dom';
+
+================
+File: frontend/.gitignore
+================
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
+
+# testing
+/coverage
+
+# production
+/build
+
+# misc
+.DS_Store
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+================
+File: frontend/Dockerfile
+================
+FROM node:18-alpine as build
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+
+RUN npm ci
+
+COPY . .
+
+RUN npm run build
+
+# Production environment
+FROM nginx:stable-alpine
+
+COPY --from=build /app/build /usr/share/nginx/html
+
+EXPOSE 3000
+
+# Custom nginx config to handle React Router
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+CMD ["nginx", "-g", "daemon off;"]
+
+================
+File: frontend/nginx.conf
+================
+server {
+    listen 3000;
+    
+    location / {
+        root /usr/share/nginx/html;
+        index index.html index.htm;
+        try_files $uri $uri/ /index.html;
+    }
+    
+    # Redirect server error pages to the static page /50x.html
+    error_page 500 502 503 504 /50x.html;
+    location = /50x.html {
+        root /usr/share/nginx/html;
+    }
+}
+
+================
+File: frontend/package.json
+================
+{
+  "name": "frontend",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "@testing-library/dom": "^10.4.0",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.2.0",
+    "@testing-library/user-event": "^13.5.0",
+    "@types/jest": "^27.5.2",
+    "@types/leaflet": "^1.9.16",
+    "@types/node": "^16.18.126",
+    "@types/react": "^19.0.12",
+    "@types/react-dom": "^19.0.4",
+    "@types/react-router-dom": "^5.3.3",
+    "@types/socket.io-client": "^1.4.36",
+    "@types/styled-components": "^5.1.34",
+    "axios": "^1.8.4",
+    "leaflet": "^1.9.4",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-leaflet": "^5.0.0",
+    "react-router-dom": "^7.4.0",
+    "react-scripts": "5.0.1",
+    "socket.io-client": "^4.7.2",
+    "styled-components": "^6.1.16",
+    "typescript": "^4.9.5",
+    "web-vitals": "^2.1.4"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject"
+  },
+  "eslintConfig": {
+    "extends": [
+      "react-app",
+      "react-app/jest"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  }
+}
+
+================
+File: frontend/README.md
+================
+# Getting Started with Create React App
+
+This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+
+## Available Scripts
+
+In the project directory, you can run:
+
+### `npm start`
+
+Runs the app in the development mode.\
+Open [http://localhost:3000](http://localhost:3000) to view it in the browser.
+
+The page will reload if you make edits.\
+You will also see any lint errors in the console.
+
+### `npm test`
+
+Launches the test runner in the interactive watch mode.\
+See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+
+### `npm run build`
+
+Builds the app for production to the `build` folder.\
+It correctly bundles React in production mode and optimizes the build for the best performance.
+
+The build is minified and the filenames include the hashes.\
+Your app is ready to be deployed!
+
+See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+
+### `npm run eject`
+
+**Note: this is a one-way operation. Once you `eject`, you can’t go back!**
+
+If you aren’t satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
+
+Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you’re on your own.
+
+You don’t have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn’t feel obligated to use this feature. However we understand that this tool wouldn’t be useful if you couldn’t customize it when you are ready for it.
+
+## Learn More
+
+You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
+
+To learn React, check out the [React documentation](https://reactjs.org/).
+
+================
+File: frontend/tsconfig.json
+================
+{
+  "compilerOptions": {
+    "target": "es5",
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "noFallthroughCasesInSwitch": true,
+    "module": "esnext",
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx"
+  },
+  "include": [
+    "src"
+  ]
+}
+
+================
+File: .gitignore
+================
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Logs
+logs
+*.log
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Build outputs
+build/
+dist/
+out/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+.env
+env.bak/
+venv.bak/
+.python-version
+
+# Docker
+.dockerignore
+
+# MongoDB data
+mongodb_data/
+
+# IDE - VSCode
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Start Generation Here
+ai-model/venv/
+# End Generation Here
+# Start Generation Here
+*.md
+!README.md
+# End Generation Here
+
+================
+File: docker-compose.yml
+================
+version: '3.8'
+services:
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    environment:
+      - REACT_APP_API_URL=http://backend:5001/api
+      - REACT_APP_SOCKET_URL=http://backend:5001
+    networks:
+      - rapidresponse
+
+  backend:
+    build: ./backend
+    ports:
+      - "5001:5001"
+    depends_on:
+      - mongodb
+    environment:
+      - PORT=5001
+      - MONGODB_URI=mongodb://mongodb:27017/rapidresponse
+      - AI_SERVICE_URL=http://ai-service:8000/predict
+      - BASE_URL=http://backend:5001
+    networks:
+      - rapidresponse
+
+  ai-service:
+    build: ./ai-model
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mongodb
+    environment:
+      - MONGODB_URI=mongodb://mongodb:27017/rapidresponse
+    networks:
+      - rapidresponse
+
+  mongodb:
+    image: mongo:latest
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - rapidresponse
+
+networks:
+  rapidresponse:
+    driver: bridge
+
+volumes:
+  mongodb_data:
+
+================
+File: install-all.sh
+================
+#!/bin/bash
+echo "Installing backend dependencies..."
+cd backend && npm install
+
+echo "Installing frontend dependencies..."
+cd ../frontend && npm install
+
+echo "Installing AI model dependencies..."
+cd ../ai-model
+
+# Check for Python version and create a compatible venv
+if command -v python3.10 &> /dev/null; then
+  # Use Python 3.10 if available
+  python3.10 -m venv venv
+elif command -v python3.9 &> /dev/null; then
+  # Use Python 3.9 if 3.10 isn't available
+  python3.9 -m venv venv
+else
+  # Fall back to system Python
+  python3 -m venv venv
+fi
+
+source venv/bin/activate
+pip install --upgrade pip setuptools wheel
+pip install -r requirements.txt
+
+echo "All dependencies installed successfully!"
+echo ""
+echo "To start the application:"
+echo "1. Start MongoDB: brew services start mongodb-community"
+echo "2. Start backend: cd backend && npm run dev"
+echo "3. Start AI model: cd ai-model && source venv/bin/activate && python main.py"
+echo "4. Start frontend: cd frontend && npm start"
+
+================
+File: README.md
+================
+# RapidResponse AI-CAD System
+
+RapidResponse is an AI-powered Computer-Aided Dispatch system for emergency services. It helps dispatchers efficiently manage incidents and emergency units using geospatial data and artificial intelligence.
+
+## Features
+
+- Real-time tracking of emergency units and incidents
+- AI-powered unit dispatch recommendations
+- Real-time updates via WebSockets
+- Interactive map view of all units and incidents
+- Incident filtering and management
+- Unit status tracking and updates
+
+## System Architecture
+
+The system consists of four main components:
+
+1. **Frontend**: React application with map visualization
+2. **Backend API**: Express.js server managing incidents and units
+3. **AI Service**: Python FastAPI service for dispatch recommendations
+4. **Database**: MongoDB for data storage
+
+## Running Locally
+
+### Prerequisites
+
+- Node.js (v14+)
+- MongoDB
+- Python 3.9+
+
+### Backend Setup
+
+```bash
+cd backend
+npm install
+# Create a .env file with:
+# PORT=5001
+# MONGODB_URI=mongodb://localhost:27017/rapidresponse
+# AI_SERVICE_URL=http://localhost:8000/predict
+# BASE_URL=http://localhost:5001
+npm start
+```
+
+### AI Service Setup
+
+```bash
+cd ai-model
+pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+### Frontend Setup
+
+```bash
+cd frontend
+npm install
+npm start
+```
+
+### Seed Sample Data
+
+```bash
+cd backend
+node scripts/seed.js
+```
+
+## Running with Docker
+
+You can run the entire system with Docker Compose:
+
+```bash
+docker-compose build
+docker-compose up
+```
+
+This will start:
+- Frontend on http://localhost:3000
+- Backend on http://localhost:5001
+- AI Service on http://localhost:8000
+- MongoDB on port 27017
+
+## License
+
+MIT
+
+
+
+================================================================
+End of Codebase
+================================================================

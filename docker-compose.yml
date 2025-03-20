@@ -1,0 +1,54 @@
+version: '3.8'
+services:
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    environment:
+      - REACT_APP_API_URL=http://backend:5001/api
+      - REACT_APP_SOCKET_URL=http://backend:5001
+    networks:
+      - rapidresponse
+
+  backend:
+    build: ./backend
+    ports:
+      - "5001:5001"
+    depends_on:
+      - mongodb
+    environment:
+      - PORT=5001
+      - MONGODB_URI=mongodb://mongodb:27017/rapidresponse
+      - AI_SERVICE_URL=http://ai-service:8000/predict
+      - BASE_URL=http://backend:5001
+    networks:
+      - rapidresponse
+
+  ai-service:
+    build: ./ai-model
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mongodb
+    environment:
+      - MONGODB_URI=mongodb://mongodb:27017/rapidresponse
+    networks:
+      - rapidresponse
+
+  mongodb:
+    image: mongo:latest
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - rapidresponse
+
+networks:
+  rapidresponse:
+    driver: bridge
+
+volumes:
+  mongodb_data: 
